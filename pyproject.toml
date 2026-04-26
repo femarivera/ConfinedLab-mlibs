@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlibs"
+version = "0.1.0"
+description = "MODFLOW 6 modelling utilities - ConfinedLab project"
+authors = [
+  { name = "MARIN RIVERA Carlos Felipe" }
+]
+license = {text = "BSD-3-Clause"} 
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "matplotlib>=3.9",
+    "flopy>=3.8",
+    "pandas>=2.0",
+    "imageio>=2.36",
+    "geopandas>=1.0",
+    "shapely",
+    "scikit-learn>=1.6",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]

@@ -1,0 +1,9 @@
+numpy>=1.26
+scipy>=1.12
+matplotlib>=3.9
+flopy>=3.8
+pandas>=2.0
+imageio>=2.36
+geopandas>=1.0
+shapely
+scikit-learn>=1.6

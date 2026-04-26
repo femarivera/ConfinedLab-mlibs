@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: mlibs
+Version: 0.1.0
+Summary: MODFLOW 6 modelling utilities - ConfinedLab project
+Author: MARIN RIVERA Carlos Felipe
+Requires-Python: >=3.9
+Requires-Dist: numpy>=1.26
+Requires-Dist: scipy>=1.12
+Requires-Dist: matplotlib>=3.9
+Requires-Dist: flopy>=3.8
+Requires-Dist: pandas>=2.0
+Requires-Dist: imageio>=2.36
+Requires-Dist: geopandas>=1.0
+Requires-Dist: shapely
+Requires-Dist: scikit-learn>=1.6
