@@ -1,4 +1,4 @@
-# ConfinedLab
+# ConfinedLab mlibs
 
 **MODFLOW 6 modelling utilities for synthetic multilayer groundwater systems.**
 
@@ -157,4 +157,3 @@ confinedlab/               ← project root
 ## Acknowledgements
 
 This work is part of the **ConfinedLab** project and was funded by the **OneWater PEPR DEESAC Project**.  
-Bordeaux INP — Lab EPOC — Université de Bordeaux.
