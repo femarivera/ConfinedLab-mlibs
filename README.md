@@ -15,7 +15,7 @@ Author: **MARIN RIVERA Carlos Felipe**
 
 ## What is this?
 
-`mlibs` is a Python package providing modular, reusable utilities to facilitate building and analyzing **MODFLOW 6** groundwater models. It is designed around multilayer groundwater systems, assisting in workflows from geometry generation to transient results analysis.
+`mlibs` is a Python package providing utilities to facilitate building and analyzing **MODFLOW 6** groundwater models. It is designed around multilayer groundwater systems, assisting in workflows from geometry generation to transient results analysis.
 
 ---
 
