@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo_confinedlab.png" height="100">
+</p>
+
 # ConfinedLab-mlibs
 
 **MODFLOW 6 modelling utilities for synthetic multilayer groundwater systems.**
@@ -6,6 +10,7 @@ Developed at **Bordeaux INP, Lab EPOC, Université de Bordeaux**
 As part of the **ConfinedLab** project, funded by the [PEPR One Water DEESAC project](https://www.onewater.fr/fr/actualite/actualite/lancement-du-projet-deesac-durabilite-exploitabilite-des-eaux-souterraines-des "Go to onewater.fr")  
 Author: **MARIN RIVERA Carlos Felipe**
 
+> 📦 This package is the utility library for the [ConfinedLab](https://github.com/femarivera/ConfinedLab) project.
 ---
 
 ## What is this?
@@ -77,26 +82,21 @@ outcrop_z    = np.array([100, 150, 200, 250, 350])  # Outcrop elevations (m), us
 outcrop_zmax = np.array([200, 300, 400, 500, 500])  # Max outcrop elevations (m), used when slope=True
 outcrop_zmin = np.array([  0, 200, 300, 400, 500])  # Min outcrop elevations (m), used when slope=True
 base_thicknesses = np.array([300, 150, 200, 150, 200])  # Layer thicknesses (m)
-outcrop_cells    = np.array([200, 150, 100,  50,   0])  # Outcrop column indices
-transition = 50  # Number of transition cells
+outcrop_cells = np.array([300, 250, 150, 100, 0])  # Outcrop column indices
+transition = 60  # Number of transition cells
 
-# Build geometry arrays
+# Create idomain and geometry arrays
 idomain = modgeom6.compute_idomain(nlay, nrow, ncol, outcrop_cells)
-ztop = modgeom6.compute_top(
-    idomain, outcrop_z,
-    transition=True, slope=True,
-    transition_cells=transition, transition_type="contain",
-    outcrop_zmin=outcrop_zmin, outcrop_zmax=outcrop_zmax
-)
-thickness_array = modgeom6.compute_thickness(
-    idomain, base_thicknesses,
-    transition=True, transition_type="contain",
-    transition_cells=transition
-)
-zbot    = modgeom6.compute_bottom(ztop, thickness_array)
+ztop = modgeom6.compute_top(idomain, outcrop_z, transition=True, slope=True,
+                            transition_cells=transition, transition_type="contain", 
+                            outcrop_zmin=outcrop_zmin, outcrop_zmax=outcrop_zmax)
+thickness_array = modgeom6.compute_thickness(idomain, base_thicknesses, 
+                                             transition=True, transition_type="extend", 
+                                             transition_cells=transition)
+zbot = modgeom6.compute_bottom(ztop, thickness_array)
 idomain = modgeom6.idomain_from_thickness(thickness_array, epsilon)
 
-# --- flopy simulation building section ---
+# --- flopy simulation building section --- #
 
 modplot6.plot_cross_section_array(
     gwf, zone_array, nrow // 2,
