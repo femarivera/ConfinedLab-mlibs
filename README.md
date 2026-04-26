@@ -15,26 +15,7 @@ Author: **MARIN RIVERA Carlos Felipe**
 
 ## What is this?
 
-`mlibs` is a Python package providing modular, reusable utilities for building, parameterising, and visualising **MODFLOW 6** groundwater models. It is designed around synthetic multilayer confined aquifer systems, covering the full workflow from geometry generation to transient results analysis.
-
----
-
-## Features
-
-- **Synthetic Geometry Generation:**  
-  Easily create multilayer geometries of synthetic stratigraphic configurations of a sedimentary multilayer system.
-
-- **Flexible Model Setup:**  
-  Quickly define model grids, hydraulic properties, boundary conditions, and recharge scenarios.
-
-- **Sustainable Yield estimations:**  
-  Maximize abstractions in a given pumping scenario subject to a series of predefined constrains.
-
-- **Visualization and Analysis:**  
-  Built-in plotting and post-processing tools for heads, flows, budgets, and more.
-
-- **Analyse parameter influence on results:**  
-  Investigate the effect of a model parameter on the sustainable yield estimations.
+`mlibs` is a Python package providing modular, reusable utilities to facilitate building and analyzing **MODFLOW 6** groundwater models. It is designed around multilayer groundwater systems, assisting in workflows from geometry generation to transient results analysis.
 
 ---
 
@@ -46,7 +27,7 @@ Author: **MARIN RIVERA Carlos Felipe**
 | `modbound6` | Create boundary condition stress period data: rivers (RIV), general head (GHB), drains (DRN) |
 | `modpar6` | Generate spatially correlated random fields of hydraulic parameters (K, Sy, Ss) using FFT-based simulation |
 | `modplot6` | Visualise model grids, heads, cross-sections, boundary conditions, and budget summaries |
-| `modpump6` | Analyse steady-state pumping scenarios: iterate pumping rates, capture rates, and water budgets |
+| `modpump6` | Analyse pumping scenarios: estimate capture rates and water budgets, estimate sustainable yields from constraints and planning horizons |
 | `modtransient6` | Process and visualise transient results: time-series heads, flows, storage release, zone budgets |
 
 ---
@@ -155,28 +136,9 @@ K_field = modpar6.generate_random_field(
 
 Functions to build the 3D grid structure of a synthetic multilayer system.
 
-```python
-modgeom6.compute_idomain(nlay, nrow, ncol, outcrop_cells, direction)
-modgeom6.compute_top(idomain, outcrop_z, transition, slope, direction, ...)
-modgeom6.compute_thickness(idomain, base_thicknesses, transition, ...)
-modgeom6.compute_bottom(ztop, thickness_array)
-modgeom6.compute_irch(idomain)
-modgeom6.compute_recharge(irch, R)
-modgeom6.subdivide_layers(idomain, ztop, zbot, nsub_layers)
-modgeom6.insert_soil_layer(ztop, zbot, idomain, soil_thickness)
-```
-
 ### `modpar6` — Parameter fields
 
 Generate spatially correlated random fields from prior knowledge of hydraulic properties.
-
-```python
-modpar6.moments_from_percentiles(k1, p1, k2, p2)
-modpar6.moments_from_arithmetic_mean_variance(arith_mean, arith_var)
-modpar6.moments_from_log_mean_variance(log_mean, log_var, log_base)
-modpar6.generate_random_field(shape, variogram_type, geom_mean, sill, nugget, range_param, ...)
-modpar6.stack_fields_to_3D(field_list, nlay, nrow, ncol)
-```
 
 ### `modbound6` — Boundary conditions
 
@@ -189,10 +151,12 @@ Visualise model structure, results, and budget components for steady-state and t
 ### `modpump6` — Pumping analysis
 
 Automate pumping rate iteration and analyse captured discharge and induced recharge in steady-state models.
+Estimate sustainable yields or maximum abstraction volumes for a given pumping scenario using transient models.
 
 ### `modtransient6` — Transient analysis
 
 Extract and visualise time-series data, storage release proportions, and zone water budgets from transient runs.
+Estimate response times to imposed stresses or changes in boundary conditions.
 
 ---
 
