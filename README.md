@@ -6,10 +6,6 @@
 
 **MODFLOW 6 modelling utilities for synthetic multilayer groundwater systems.**
 
-Developed at **Bordeaux INP, Lab EPOC, Université de Bordeaux**  
-As part of the **ConfinedLab** project, funded by the [PEPR One Water DEESAC project](https://www.onewater.fr/fr/actualite/actualite/lancement-du-projet-deesac-durabilite-exploitabilite-des-eaux-souterraines-des "Go to onewater.fr")  
-Author: **MARIN RIVERA Carlos Felipe**
-
 > 📦 This package is the utility library for the [ConfinedLab](https://github.com/femarivera/ConfinedLab) project.
 ---
 
@@ -185,9 +181,9 @@ This project is licensed under the BSD 3-Clause License — see the [LICENSE](LI
 
 ---
 
-## Contact
+Funded by the [PEPR One Water DEESAC project](https://www.onewater.fr/fr/actualite/actualite/lancement-du-projet-deesac-durabilite-exploitabilite-des-eaux-souterraines-des "Go to onewater.fr")  
 
-For questions, suggestions, or contributions, please contact:
+## Contact
 
 **Carlos Felipe Marin Rivera**  
 Bordeaux INP, UMR 5805 Lab EPOC, Université de Bordeaux  
