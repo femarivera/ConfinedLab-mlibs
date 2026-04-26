@@ -19,6 +19,25 @@ Author: **MARIN RIVERA Carlos Felipe**
 
 ---
 
+## Features
+
+- **Synthetic Geometry Generation:**  
+  Easily create multilayer geometries of synthetic stratigraphic configurations of a sedimentary multilayer system.
+
+- **Flexible Model Setup:**  
+  Quickly define model grids, hydraulic properties, boundary conditions, and recharge scenarios.
+
+- **Sustainable Yield estimations:**  
+  Maximize abstractions in a given pumping scenario subject to a series of predefined constrains.
+
+- **Visualization and Analysis:**  
+  Built-in plotting and post-processing tools for heads, flows, budgets, and more.
+
+- **Analyse parameter influence on results:**  
+  Investigate the effect of a model parameter on the sustainable yield estimations.
+
+---
+
 ## Modules
 
 | Module | Description |
