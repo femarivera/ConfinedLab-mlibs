@@ -150,7 +150,7 @@ Visualise model structure, results, and budget components for steady-state and t
 
 ### `modpump6` — Pumping analysis
 
-Automate pumping rate iteration and analyse captured discharge and induced recharge in steady-state models.
+Automate pumping rate iteration and analyse capture distribution accross budget components.
 Estimate sustainable yields or maximum abstraction volumes for a given pumping scenario using transient models.
 
 ### `modtransient6` — Transient analysis
