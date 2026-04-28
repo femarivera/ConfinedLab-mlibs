@@ -45,7 +45,8 @@ def plot_map_view(gwf,
                   fontsize=14,
                   title="Model map view", 
                   transient = False,
-                  time_step=0):
+                  time_step=0,
+                  scale=60):
     """
     Plots a map view for a MODFLOW 6 groundwater flow model.
 
@@ -65,6 +66,7 @@ def plot_map_view(gwf,
         title (str): Title for the plot.
         transient (bool): Whether the input is transient or steady state.
         time_step (int): Time step index to plot for transient data.
+        scale (float): Scaling factor for flow vectors.
 
     Outputs:
         Displays the map view plot and/or saves it to a file.
@@ -155,7 +157,7 @@ def plot_map_view(gwf,
         else:
             spdis = cbb.get_data(text='DATA-SPDIS')[0]
         qx, qy, qz = flopy.utils.postprocessing.get_specific_discharge(spdis, gwf)
-        modelmap.plot_vector(qx, qy, normalize=True, color="white", headwidth=2, headlength=1, headaxislength=1, scale=60)
+        modelmap.plot_vector(qx, qy, normalize=True, color="white", headwidth=2, headlength=1, headaxislength=1, scale=scale)
 
     # Dynamically plot boundary conditions based on keywords
     if boundary_keywords:
@@ -361,7 +363,8 @@ def plot_cross_section_row(gwf,
                            vmax=None,
                            transient=False,
                            time_step=0, 
-                           interfaces=None):
+                           interfaces=None,
+                           scale=60):
     """
     Plots a cross-section for a MODFLOW 6 groundwater flow model along a specified row.
 
@@ -387,6 +390,7 @@ def plot_cross_section_row(gwf,
         transient (bool): Whether the input is transient or steady state.
         time_step (int): Time step index to plot for transient data.
         interfaces (np.ndarray, optional): 3D array of layer interfaces for plotting.
+        scale (float, optional): Scaling factor for flow vectors.
 
     Outputs:
         Displays the cross-section plot and/or saves it to a file.
@@ -504,7 +508,7 @@ def plot_cross_section_row(gwf,
             spdis = cbb.get_data(text='DATA-SPDIS')[0]
         qx, qy, qz = flopy.utils.postprocessing.get_specific_discharge(spdis, gwf)
         section.plot_vector(qx, qy, qz, normalize=True, color="white", head=masked_head,
-                            hstep=int(ncol//50), headwidth=2, headlength=1, headaxislength=1, scale=60)
+                            hstep=int(ncol//50), headwidth=2, headlength=1, headaxislength=1, scale=scale)
 
     # Dynamically plot boundary conditions based on keywords
     if boundary_keywords:
@@ -580,7 +584,8 @@ def plot_cross_section_col(gwf,
                            vmax=None,
                            transient=False,
                            time_step=0,
-                           interfaces=None):
+                           interfaces=None,
+                           scale=60):
     """
     Plots a cross-section for a MODFLOW 6 groundwater flow model along a specified column.
 
@@ -606,7 +611,7 @@ def plot_cross_section_col(gwf,
         transient (bool): Whether the input is transient or steady state.
         time_step (int): Time step index to plot for transient data.
         interfaces (np.ndarray, optional): 3D array of layer interfaces for plotting.
-
+        scale (float, optional): Scaling factor for flow vectors.
     Outputs:
         Displays the cross-section plot and/or saves it to a file.
     """
@@ -719,7 +724,7 @@ def plot_cross_section_col(gwf,
             spdis = cbb.get_data(text='DATA-SPDIS')[0]
         qx, qy, qz = flopy.utils.postprocessing.get_specific_discharge(spdis, gwf)
         section.plot_vector(qx, qy, qz, normalize=True, color="white", head=masked_head, 
-                            hstep=int(nrow//50), headwidth=2, headlength=1, headaxislength=1, scale=60)
+                            hstep=int(nrow//50), headwidth=2, headlength=1, headaxislength=1, scale=scale)
         
     # Dynamically plot boundary conditions based on keywords
     if boundary_keywords:
