@@ -507,7 +507,7 @@ def plot_cross_section_row(gwf,
         else:
             spdis = cbb.get_data(text='DATA-SPDIS')[0]
         qx, qy, qz = flopy.utils.postprocessing.get_specific_discharge(spdis, gwf)
-        section.plot_vector(qx, qy, qz, normalize=True, color="white", head=masked_head,
+        section.plot_vector(qx, qy, qz * ve, normalize=True, color="white", head=masked_head,
                             hstep=int(ncol//50), headwidth=2, headlength=1, headaxislength=1, scale=scale)
 
     # Dynamically plot boundary conditions based on keywords
@@ -723,7 +723,7 @@ def plot_cross_section_col(gwf,
         else:
             spdis = cbb.get_data(text='DATA-SPDIS')[0]
         qx, qy, qz = flopy.utils.postprocessing.get_specific_discharge(spdis, gwf)
-        section.plot_vector(qx, qy, qz, normalize=True, color="white", head=masked_head, 
+        section.plot_vector(qx, qy, qz * ve, normalize=True, color="white", head=masked_head, 
                             hstep=int(nrow//50), headwidth=2, headlength=1, headaxislength=1, scale=scale)
         
     # Dynamically plot boundary conditions based on keywords
