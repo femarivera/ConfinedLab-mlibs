@@ -19,15 +19,20 @@
 #  - If zones are defined, plots and analyses water budgets for each zone.
 
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.cm import get_cmap
-from matplotlib.colors import LogNorm
 import numpy as np
 import os
 import sys
 import flopy
+import matplotlib.pyplot as plt
+from matplotlib.cm import get_cmap
+from matplotlib.colors import LogNorm
+from matplotlib.ticker import FuncFormatter, FixedLocator
+from matplotlib.lines import Line2D
+from sklearn.linear_model import LinearRegression
 from scipy.optimize import curve_fit
 from sklearn.metrics import r2_score
+from sklearn.metrics import r2_score
+from scipy.interpolate import griddata
 
 # Import local modules
 sys.path.append('..')
@@ -4041,7 +4046,7 @@ def response_time_array_relative(
         else:
             counts, bin_edges, patches = plt.hist(flat_data, bins=histogram_bins, edgecolor='black')
 
-        # Automatically cut the x-axis from the upper limit of the first bin
+        # Automatically cut the x-axis from the upper limit of the first bin (zoom visualization of longer response times)
         first_bin_max = bin_edges[1]
         plt.xlim(first_bin_max, None)
     
@@ -4164,3 +4169,800 @@ def perform_mat_analysis(csv_path, time_col=0, var_col=1, fig_output_folder=".",
     plt.close(fig)
     
     return tr
+
+# --------- Postprocessing response times
+
+def volume_weighted_percentile(values, volumes, percentile):
+    mask = np.isfinite(values) & np.isfinite(volumes) & (volumes > 0)
+    values = values[mask]
+    volumes = volumes[mask]
+
+    if len(values) == 0:
+        return np.nan
+
+    order = np.argsort(values)
+    values_sorted = values[order]
+    volumes_sorted = volumes[order]
+
+    cum_vol = np.cumsum(volumes_sorted)
+    cum_frac = cum_vol / cum_vol[-1]
+
+    return np.interp(percentile / 100.0, cum_frac, values_sorted)
+
+def volume_weighted_mean(values, volumes):
+    mask = np.isfinite(values) & np.isfinite(volumes) & (volumes > 0)
+    if np.sum(volumes[mask]) == 0:
+        return np.nan
+    return np.sum(values[mask] * volumes[mask]) / np.sum(volumes[mask])
+
+def load_cell_volumes(dis_path):
+    """
+    Load MF6 DIS and compute cell volumes.
+    """
+    sim_ws = os.path.dirname(dis_path)
+
+    sim = flopy.mf6.MFSimulation.load(
+        sim_ws=sim_ws,
+        load_only=["dis"],
+        verbosity_level=0,)
+
+    model = sim.get_model()
+    dis = model.dis
+
+    delr = dis.delr.array
+    delc = dis.delc.array
+    top = dis.top.array
+    botm = dis.botm.array
+
+    nlay, nrow, ncol = botm.shape
+
+    thickness = np.zeros((nlay, nrow, ncol))
+    for k in range(nlay):
+        if k == 0:
+            thickness[k] = top - botm[k]
+        else:
+            thickness[k] = botm[k - 1] - botm[k]
+
+    area = np.outer(delc, delr)
+    volumes = thickness * area[np.newaxis, :, :]
+
+    return volumes
+
+def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B, L, subfolder_keyword="parv_"):
+    """
+    Collect results and append volume-weighted statistics per zone and total.
+    """
+    zone_records = []
+
+    for folder in os.listdir(main_folder):
+        folder_path = os.path.join(main_folder, folder)
+        if not os.path.isdir(folder_path):
+            continue
+        if not folder.startswith(subfolder_keyword):
+            continue
+
+        setup_path = os.path.join(folder_path, "setup.xlsx")
+        output_path = os.path.join(folder_path, "mf", "output", "tr_zones_relative_local.csv")
+
+        if not os.path.exists(setup_path):
+            print(f"Missing setup file: {setup_path}")
+            continue
+        if not os.path.exists(output_path):
+            print(f"Missing zone output file: {output_path}")
+            continue
+
+        # --- READ PARAMETERS ---
+        df_setup = pd.read_excel(setup_path, sheet_name="parameters")
+        param_dict = df_setup.set_index("par_name")["value"].to_dict()
+
+        zones = sorted({name.split("_")[-1] for name in param_dict.keys() if "_" in name})
+        zones_h = [int(z) for z in zones if int(z) % 2 == 1] #Aquifers
+        zones_v = [int(z) for z in zones if int(z) % 2 == 0] #Aquitards
+        
+        kv = {int(z): param_dict.get(f"kv_{z}")/86400 for z in zones} # Converted to m/s
+        kh = {int(z): param_dict.get(f"kh_{z}")/86400 for z in zones} # Converted to m/s
+        ss = {int(z): param_dict.get(f"ss_{z}") for z in zones}
+        sy = {int(z): param_dict.get(f"sy_{z}") for z in zones}
+
+        # --- READ INPUT DICTIONARIES ---
+        thickness = {int(z): thickness_dict.get(int(z), np.nan) for z in zones}
+        length = {int(z): length_dict.get(int(z), np.nan) for z in zones}
+        unc_length = {int(z): unc_length_dict.get(int(z), np.nan) for z in zones}
+
+        # --- INITIALIZE OUTPUT DATAFRAME ---
+        df_zone_out = pd.DataFrame({"zone": sorted(map(int, zones))})
+
+        # --- COMPUTE Dv, Dh, Dv_eq, Dh_eq ---  
+        Dv = {int(z): (kv[int(z)] / ss[int(z)]) for z in zones} 
+        Dh = {int(z): (kh[int(z)] / ss[int(z)] if int(z)!=1 else kh[int(z)] * thickness[int(z)] / sy[int(z)]) for z in zones}
+
+        Dv_eq = B / sum(thickness[int(z)] / Dv[int(z)] for z in zones)
+        Dh_eq = sum(Dh[int(z)] * thickness[int(z)] for z in zones) / sum(thickness[int(z)] for z in zones)
+
+        kv_eq = B / sum(thickness[int(z)] / kv[int(z)] for z in zones)
+        kh_eq = sum(kh[int(z)] * thickness[int(z)] for z in zones) / sum(thickness[int(z)] for z in zones)
+
+        # Merge computed parameters
+        df_zone_out["kv"] = df_zone_out["zone"].map(kv)
+        df_zone_out["kh"] = df_zone_out["zone"].map(kh)
+        df_zone_out["ss"] = df_zone_out["zone"].map(ss)
+        df_zone_out["sy"] = df_zone_out["zone"].map(sy)
+        df_zone_out["Dv"] = df_zone_out["zone"].map(Dv)
+        df_zone_out["Dh"] = df_zone_out["zone"].map(Dh)
+        df_zone_out["thickness"] = df_zone_out["zone"].map(thickness)
+        df_zone_out["length"] = df_zone_out["zone"].map(length)
+        df_zone_out["unc_length"] = df_zone_out["zone"].map(unc_length)
+        df_zone_out["conf_length"] = df_zone_out["length"] - df_zone_out["unc_length"]
+        df_zone_out["Dv_eq"] = Dv_eq
+        df_zone_out["Dh_eq"] = Dh_eq
+        df_zone_out["kv_eq"] = kv_eq
+        df_zone_out["kh_eq"] = kh_eq
+        df_zone_out["anisotropy"] = df_zone_out["kh"] / df_zone_out["kv"]
+        df_zone_out["ratio"] = df_zone_out["Dv_eq"] / df_zone_out["Dh_eq"]
+
+        # ----------------------------------------------------------------------- #
+        # -------------------- COMPUTE RESPONSE TIME STATISTICS ----------------- #
+        # ----------------------------------------------------------------------- # 
+        dis_path = os.path.join(folder_path, "mf", "DEESAC.dis")
+        zone_path = os.path.join(folder_path, "mf", "zone_array.npy")
+        tr_array_path = os.path.join(folder_path, "mf", "output", "response_time_relative_local.npy")
+
+        if os.path.exists(dis_path) and os.path.exists(zone_path) and os.path.exists(tr_array_path):
+            volumes_3d = load_cell_volumes(dis_path)
+            volumes = volumes_3d.flatten()
+            tr_array_3d = np.load(tr_array_path) / 360.0
+            tr_array = tr_array_3d.flatten()
+            zones_array = np.load(zone_path).flatten()
+
+            # Unconfined (top most active cells) response times
+            valid_mask = ~np.isnan(tr_array_3d)
+            valid_count = np.sum(valid_mask, axis=0)
+            irch = tr_array_3d.shape[0] - valid_count
+            nlay, nrow, ncol = tr_array_3d.shape
+            i_idx, j_idx = np.indices((nrow, ncol))
+            mask = j_idx < (ncol - 2)
+            k_idx = irch[mask]
+            i_idx = i_idx[mask]
+            j_idx = j_idx[mask]
+            tr_unc = tr_array_3d[k_idx, i_idx, j_idx]
+            vol_unc = volumes_3d[k_idx, i_idx, j_idx]
+            df_zone_out["tr_unc_mean_vol"] = volume_weighted_mean(tr_unc, vol_unc)
+            df_zone_out["tr_unc_5p_vol"] = volume_weighted_percentile(tr_unc, vol_unc, 5)
+            df_zone_out["tr_unc_median_vol"] = volume_weighted_percentile(tr_unc, vol_unc, 50)
+            df_zone_out["tr_unc_95p_vol"] = volume_weighted_percentile(tr_unc, vol_unc, 95)
+            df_zone_out["tr_unc_max"] = np.nanmax(tr_unc)
+
+            # --- per-zone stats ---
+            tr_mean_vol = []
+            tr_5p_vol = []
+            tr_median_vol = []
+            tr_90p_vol = []
+            tr_95p_vol = []
+            tr_max = []
+
+            for z in df_zone_out["zone"]:
+                mask = zones_array == z
+                if not np.any(mask):
+                    tr_mean_vol.append(np.nan)
+                    tr_5p_vol.append(np.nan)
+                    tr_median_vol.append(np.nan)
+                    tr_90p_vol.append(np.nan)
+                    tr_95p_vol.append(np.nan)
+                    tr_max.append(np.nan)
+                    continue
+
+                tr_zone_vals = tr_array[mask]
+                vol_zone = volumes[mask]
+
+                tr_mean_vol.append(volume_weighted_mean(tr_zone_vals, vol_zone))
+                tr_5p_vol.append(volume_weighted_percentile(tr_zone_vals, vol_zone, 5))
+                tr_median_vol.append(volume_weighted_percentile(tr_zone_vals, vol_zone, 50))
+                tr_90p_vol.append(volume_weighted_percentile(tr_zone_vals, vol_zone, 90))
+                tr_95p_vol.append(volume_weighted_percentile(tr_zone_vals, vol_zone, 95))
+                tr_max.append(np.nanmax(tr_zone_vals))
+
+            df_zone_out["tr_mean_vol_zone"] = tr_mean_vol
+            df_zone_out["tr_5p_vol_zone"] = tr_5p_vol
+            df_zone_out["tr_median_vol_zone"] = tr_median_vol
+            df_zone_out["tr_90p_vol_zone"] = tr_90p_vol
+            df_zone_out["tr_95p_vol_zone"] = tr_95p_vol
+            df_zone_out["tr_max_zone"] = tr_max
+
+            # --- total/system stats ---
+            df_zone_out["tr_mean_vol"] = volume_weighted_mean(tr_array, volumes)
+            df_zone_out["tr_5p_vol"] = volume_weighted_percentile(tr_array, volumes, 5)
+            df_zone_out["tr_median_vol"] = volume_weighted_percentile(tr_array, volumes, 50)
+            df_zone_out["tr_90p_vol"] = volume_weighted_percentile(tr_array, volumes, 90)
+            df_zone_out["tr_95p_vol"] = volume_weighted_percentile(tr_array, volumes, 95)
+            df_zone_out["tr_max"] = np.nanmax(tr_array)
+
+            # --- grouped stats: aquifers vs aquitards ---
+            mask_aqf = np.isin(zones_array, zones_h) & (zones_array != 1)
+            mask_aqt = np.isin(zones_array, zones_v)
+
+            # Aquifers (h)
+            if np.any(mask_aqf):
+                tr_aqf = tr_array[mask_aqf]
+                vol_aqf = volumes[mask_aqf]
+
+                df_zone_out["tr_mean_vol_aqf"] = volume_weighted_mean(tr_aqf, vol_aqf)
+                df_zone_out["tr_5p_vol_aqf"] = volume_weighted_percentile(tr_aqf, vol_aqf, 5)
+                df_zone_out["tr_median_vol_aqf"] = volume_weighted_percentile(tr_aqf, vol_aqf, 50)
+                df_zone_out["tr_90p_vol_aqf"] = volume_weighted_percentile(tr_aqf, vol_aqf, 90)
+                df_zone_out["tr_95p_vol_aqf"] = volume_weighted_percentile(tr_aqf, vol_aqf, 95)
+                df_zone_out["tr_max_aqf"] = np.nanmax(tr_aqf)
+
+            # Aquitards (v)
+            if np.any(mask_aqt):
+                tr_aqt = tr_array[mask_aqt]
+                vol_aqt = volumes[mask_aqt]
+
+                df_zone_out["tr_mean_vol_aqt"] = volume_weighted_mean(tr_aqt, vol_aqt)
+                df_zone_out["tr_5p_vol_aqt"] = volume_weighted_percentile(tr_aqt, vol_aqt, 5)
+                df_zone_out["tr_median_vol_aqt"] = volume_weighted_percentile(tr_aqt, vol_aqt, 50)
+                df_zone_out["tr_90p_vol_aqt"] = volume_weighted_percentile(tr_aqt, vol_aqt, 90)
+                df_zone_out["tr_95p_vol_aqt"] = volume_weighted_percentile(tr_aqt, vol_aqt, 95)
+                df_zone_out["tr_max_aqt"] = np.nanmax(tr_aqt)
+
+        else:
+            print(f"Missing volume or tr data in folder {folder}")
+            df_zone_out["tr_mean_vol_zone"] = np.nan
+            df_zone_out["tr_5p_vol_zone"] = np.nan
+            df_zone_out["tr_median_vol_zone"] = np.nan
+            df_zone_out["tr_90p_vol_zone"] = np.nan
+            df_zone_out["tr_95p_vol_zone"] = np.nan
+            df_zone_out["tr_max_zone"] = np.nan
+            df_zone_out["tr_mean_vol"] = np.nan
+            df_zone_out["tr_5p_vol"] = np.nan
+            df_zone_out["tr_median_vol"] = np.nan
+            df_zone_out["tr_90p_vol"] = np.nan
+            df_zone_out["tr_95p_vol"] = np.nan
+            df_zone_out["tr_max"] = np.nan
+            df_zone_out["tr_mean_vol_aqf"] = np.nan
+            df_zone_out["tr_5p_vol_aqf"] = np.nan
+            df_zone_out["tr_median_vol_aqf"] = np.nan
+            df_zone_out["tr_90p_vol_aqf"] = np.nan
+            df_zone_out["tr_95p_vol_aqf"] = np.nan
+            df_zone_out["tr_max_aqf"] = np.nan
+            df_zone_out["tr_mean_vol_aqt"] = np.nan
+            df_zone_out["tr_5p_vol_aqt"] = np.nan
+            df_zone_out["tr_median_vol_aqt"] = np.nan
+            df_zone_out["tr_90p_vol_aqt"] = np.nan
+            df_zone_out["tr_95p_vol_aqt"] = np.nan
+            df_zone_out["tr_max_aqt"] = np.nan
+
+        zone_records.append(df_zone_out)
+
+        # ----------------------------------------------------------------------- #
+        # -------------------- COMPUTE ANALYTICAL TIMESCALES -------------------- #
+        # ----------------------------------------------------------------------- #
+
+        conversion = 1 / (86400*360)
+
+        # --- Equivalent homogeneous timescales ---
+        tao_v_eq = (B**2 / Dv_eq) * conversion
+        tao_h_eq = (L**2 / Dh_eq) * conversion
+        tr_v_eq = (12/np.pi**2) * tao_v_eq
+        tr_h_eq = (3/np.pi**2) * tao_h_eq
+
+        # --- Timescales per zone ---
+        mean_thickness_v = df_zone_out.loc[
+            df_zone_out["zone"].isin(zones_v),
+            "thickness"].mean()
+
+        tao_h_zone = conversion * df_zone_out["length"]**2 / df_zone_out["Dh"].values
+        tao_v_zone = conversion * df_zone_out["thickness"]**2 / df_zone_out["Dv"].values
+        tr_h_zone = (3/np.pi**2) * tao_h_zone
+        tr_v_zone = (3/np.pi**2) * tao_v_zone
+        tr_zone = np.where(df_zone_out["zone"].isin(zones_h), tr_h_zone, tr_v_zone)
+
+        # --- Timescales for the mixed aquifer formulation ---#      
+        tr_mixed_zone = 3 * conversion * df_zone_out["unc_length"] * df_zone_out["sy"] \
+            * (df_zone_out["conf_length"] + df_zone_out["unc_length"]/2) / (df_zone_out["thickness"] * df_zone_out["kh"])
+
+        tr_mixed_eq = 3 *conversion * df_zone_out["unc_length"] * df_zone_out["sy"] \
+             * (df_zone_out["conf_length"] + df_zone_out["unc_length"]/2) / (df_zone_out["thickness"] * df_zone_out["kh_eq"])
+        
+        # --- Revised analytical response time for the deepest confined aquifer ---#
+        tr_aquifer = 1 / ((1/tr_h_eq)+(1/tr_v_eq))
+        # tr_aquifer = max(tr_aquifer, df_zone_out["tr_unc_mean_vol"].iloc[0])
+
+        # --- Revised analytical basin-scale response time ---#
+        tr_basin = np.where(Dv_eq / Dh_eq > 4*(mean_thickness_v)**2 / L**2,
+                            1 / ((1/tr_h_eq)+(1/tr_v_eq)),
+                            tr_v_zone.max())
+        # tr_basin = max(tr_basin, df_zone_out["tr_unc_mean_vol"].iloc[0])
+
+        tr_basin_arid = np.where(
+            Dv_eq / Dh_eq > 4*(mean_thickness_v)**2 / L**2,
+            tr_h_eq,
+            tr_v_zone.max()
+            ) #Arid areas
+        # tr_basin_arid = max(tr_basin_arid, df_zone_out["tr_unc_mean_vol"].iloc[0]) 
+
+        # --- Append analytical timescales to dataframe ---
+        df_zone_out["tao_v_eq"] = tao_v_eq
+        df_zone_out["tao_h_eq"] = tao_h_eq
+        df_zone_out["tr_v_eq"] = tr_v_eq
+        df_zone_out["tr_h_eq"] = tr_h_eq
+
+        df_zone_out["tao_h_zone"] = tao_h_zone
+        df_zone_out["tao_v_zone"] = tao_v_zone
+        df_zone_out["tr_h_zone"] = tr_h_zone
+        df_zone_out["tr_v_zone"] = tr_v_zone
+        df_zone_out["tr_zone"] = tr_zone
+
+        df_zone_out["tr_mixed_zone"] = tr_mixed_zone
+        df_zone_out["tr_mixed_eq"] = tr_mixed_eq
+
+        df_zone_out["tr_aquifer"] = tr_aquifer
+        df_zone_out["tr_basin"] = tr_basin
+        df_zone_out["tr_basin_arid"] = tr_basin_arid
+
+        df_zone_out["folder"] = folder
+
+        df_zone_out["sim"] = np.log10(df_zone_out["tr_95p_vol"])
+        df_zone_out["an"] = np.log10(df_zone_out["tr_basin"])
+        df_zone_out["diff"] = df_zone_out["sim"] - df_zone_out["an"]
+
+    df_analysis = pd.concat(zone_records, ignore_index=True)
+    df_analysis = df_analysis.sort_values(by="Dv_eq").reset_index(drop=True)
+    return df_analysis
+
+def loglog_scatter_df(
+    df,
+    x_column,
+    y_column,
+    color_column=None,
+    zone_column="zone",
+    zone_value=None,         # zone to filter points
+    color_zone_value=None,   # zone to get color values
+    color_bar_label=None,
+    xlabel=None,
+    ylabel=None,
+    title=None,
+    cmap="viridis_r",
+    marker_size=50,
+    min_val = None,
+    max_val= None,
+    SAVE = False,
+    output_path = "loglog_scatter.png"
+):
+    """
+    Creates a log-log scatter plot from a DataFrame with consistent styling.
+    Allows separate zones for plotting and for color values.
+
+    Args:
+        df: pandas DataFrame.
+        x_column: Column name for x-axis values.
+        y_column: Column name for y-axis values.
+        color_column: Column name for coloring points (optional).
+        zone_column: Column name for zone filtering.
+        zone_value: Zone value to filter points for plotting.
+        color_zone_value: Zone value to select color values.
+        xlabel: X-axis label.
+        ylabel: Y-axis label.
+        title: Plot title.
+        cmap: Colormap for points.
+        marker_size: Scatter marker size.
+        min_val: Minimum value for axis limits.
+        max_val: Maximum value for axis limits.
+        SAVE: Whether to save the plot.
+        output_path: Path to save the plot if SAVE is True.
+    """
+
+    # Filter points to plot
+    if zone_value is not None:
+        df_plot = df[df[zone_column] == zone_value]
+    else:
+        df_plot = df.copy()
+
+    x = df_plot[x_column].values
+    y = df_plot[y_column].values
+
+    # --- Compute metrics in log space ---
+    mask = (x > 0) & (y > 0)
+
+    if np.sum(mask) > 1:
+        logx = np.log10(x[mask])
+        logy = np.log10(y[mask])
+
+        # Linear regression in log space
+        slope, intercept = np.polyfit(logx, logy, 1)
+        logy_pred = slope * logx + intercept
+
+        # Residuals
+        residuals = logy - logy_pred
+
+        # --- Metrics ---
+        ss_res = np.sum(residuals ** 2)
+        ss_tot = np.sum((logy - np.mean(logy)) ** 2)
+        r2 = 1 - ss_res / ss_tot
+
+        mae = np.mean(np.abs(residuals))
+        rmse = np.sqrt(np.mean(residuals ** 2))
+        # bias = np.mean(residuals)
+
+        # --- KGE (log space) ---
+        r = np.corrcoef(logy, logy_pred)[0, 1]
+        alpha = np.std(logy_pred) / np.std(logy)
+        beta = np.mean(logy_pred) / np.mean(logy)
+        kge = 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+
+    else:
+        r2 = mae = rmse = bias = kge = np.nan
+
+    # Select color values
+    if color_column:
+        if color_zone_value is not None:
+            # Match color values from another zone
+            df_color = df[df[zone_column] == color_zone_value]
+            # Ensure alignment by index if same size; otherwise fallback
+            if len(df_color) == len(df_plot):
+                c = df_color[color_column].values
+            else:
+                c = df_plot[color_column].values  # fallback to same zone
+        else:
+            c = df_plot[color_column].values
+    else:
+        c = 'blue'
+
+    # --- Plot ---
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=200)
+
+    if color_column:
+        # Ensure positive values for LogNorm
+        c_pos = np.array(c, dtype=float)
+        c_pos[c_pos <= 0] = np.nan
+        sc = ax.scatter(
+            x, y, c=c_pos, cmap=cmap, s=marker_size,
+            edgecolors='black', linewidths=0.5,
+            norm=LogNorm(vmin=np.nanmin(c_pos), vmax=np.nanmax(c_pos))
+        )
+        # cb = fig.colorbar(sc, ax=ax, orientation='vertical', shrink=0.85)
+        # cb.set_label(color_bar_label if color_bar_label else (f"{color_column} (zone {color_zone_value})" if color_zone_value else color_column))
+
+        cb = fig.colorbar(sc, ax=ax, orientation='vertical', shrink=0.85)
+        cb.set_label(color_bar_label if color_bar_label else (f"{color_column} (zone {color_zone_value})" if color_zone_value else color_column))
+        #cb.ax.invert_yaxis()   # <-- this flips the colorbar visually
+
+    else:
+        sc = ax.scatter(
+            x, y, c=c, cmap=cmap, s=marker_size,
+            edgecolors='black', linewidths=0.5
+        )
+
+    # 1:1 dashed reference line
+    if min_val is not None:
+        min_val = min_val
+    else: 
+        min_val = min(np.nanmin(x), np.nanmin(y))
+    
+    if max_val is not None:
+        max_val = max_val
+    else:
+        max_val = max(np.nanmax(x), np.nanmax(y))
+    ax.plot([min_val, max_val], [min_val, max_val], 'k--', linewidth=1)
+
+    # Log scales
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+
+    # Labels & title
+    if xlabel: ax.set_xlabel(xlabel)
+    if ylabel: ax.set_ylabel(ylabel)
+    if title: ax.set_title(title)
+
+    ax.set_aspect('equal', adjustable='box')
+
+    # --- Metrics box ---
+    if not np.isnan(r2):
+        ax.text(
+            0.05, 0.95,
+            (
+                f"$R^2$ = {r2:.3f}\n"
+                f"MAE = {mae:.3f}\n"
+                f"RMSE = {rmse:.3f}\n"
+                # f"BIAS = {bias:.3f}\n"
+                f"KGE = {kge:.3f}"
+            ),
+            transform=ax.transAxes,
+            fontsize=9,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white',
+                    alpha=0.85, edgecolor='black')
+        )
+
+    plt.tight_layout()
+    if SAVE:
+        plt.savefig(output_path, dpi=300)
+    else:
+        plt.show()
+
+def loglog_contours_df(
+    df,
+    x_col,
+    y_col,
+    z_col,
+    B=None,
+    L=None,
+    B1=None,
+    anis=None,
+    x_label="X variable",
+    y_label="Y variable",
+    z_label="Response time [years]",
+    y_max_log=None,
+    y_min_log=None,
+    x_min_log=None,
+    x_max_log=None, 
+    grid_n=80, 
+    regression = False,
+    SAVE = False,
+    output_path_regression = None,
+    output_path_interpolation = None):
+    
+    """
+    Fits log10(Z) = a·log10(X) + b·log10(Y) + c
+    and produces:
+      - Regression contour plot
+      - Interpolated contour plot
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input dataframe
+    x_col, y_col, z_col : str
+        Column names for X, Y, Z
+    B, L : float, optional
+        If provided, plots reference line: Y/X = B²/L²
+    x_label, y_label, z_label : str
+        Axis / colorbar labels
+    y_max_log : float, optional
+        Upper limit in log10(Y); defaults to data max
+    grid_n : int
+        Grid resolution
+    regression : bool
+        If True, fits and plots the regression surface; otherwise only interpolation
+    SAVE : bool
+        If True, saves the figures
+    output_path_regression : str
+        Path to save the regression figure if SAVE is True
+    output_path_interpolation : str
+        Path to save the interpolation figure if SAVE is True
+    """
+    # --- Log transforms ---
+    d = pd.DataFrame({
+    "X": np.asarray(x_col),
+    "Y": np.asarray(y_col),
+    "Z": np.asarray(z_col),})
+    d["logX"] = np.log10(d["X"])
+    d["logY"] = np.log10(d["Y"])
+    d["logZ"] = np.log10(d["Z"])
+    d = d.replace([np.inf, -np.inf], np.nan).dropna()
+
+    # --- Regression ---
+    Xmat = d[["logX", "logY"]].values
+    yvec = d["logZ"].values
+
+    model = LinearRegression().fit(Xmat, yvec)
+    a, b = model.coef_
+    c = model.intercept_
+    r2 = r2_score(yvec, model.predict(Xmat))
+    K = 10 ** c
+
+    print(f"logZ = {a:.3f}·logX + {b:.3f}·logY + {c:.3f}")
+    print(f"R² = {r2:.4f}")
+    print(f"Physical form: Z = {K:.3e} · X^{a:.3f} · Y^{b:.3f}")
+
+    # --- Grids ---
+    x_log_min = x_min_log if x_min_log is not None else d["logX"].min()
+    x_log_max = x_max_log if x_max_log is not None else d["logX"].max()
+    y_log_min = y_min_log if y_min_log is not None else d["logY"].min()
+    y_log_max = y_max_log if y_max_log is not None else d["logY"].max()
+
+    Xg = np.linspace(x_log_min, x_log_max, grid_n)
+    Yg = np.linspace(y_log_min, y_log_max, grid_n)
+    Xgrid, Ygrid = np.meshgrid(Xg, Yg)
+
+    # --- Surfaces ---
+    Z_pred = a * Xgrid + b * Ygrid + c
+
+    Z_interp = griddata(
+        (d["logX"], d["logY"]),
+        d["logZ"],
+        (Xgrid, Ygrid),
+        method="cubic",)
+
+    # --- Fill NaNs ---
+    def _fill_nans(Z):
+        Zf = Z.copy()
+        if np.isnan(Zf).any():
+            Z_lin = griddata(
+                (d["logX"], d["logY"]),
+                d["logZ"],
+                (Xgrid, Ygrid),
+                method="linear",)
+            Zf = np.where(np.isnan(Zf), Z_lin, Zf)
+        if np.isnan(Zf).any():
+            Z_near = griddata(
+                (d["logX"], d["logY"]),
+                d["logZ"],
+                (Xgrid, Ygrid),
+                method="nearest",)
+            Zf = np.where(np.isnan(Zf), Z_near, Zf)
+        return Zf
+
+    Z_interp_filled = _fill_nans(Z_interp)
+
+    # --- Levels ---
+    vmin = np.floor(d["logZ"].min())
+    vmax = np.ceil(d["logZ"].max())
+    levels_fill = np.linspace(vmin, vmax, 100)
+    levels_contour = np.arange(vmin, vmax + 1)
+
+    # --- Reference line ---
+    if B is not None and L is not None:
+        ratio_log = np.log10((B ** 2) / (L ** 2))
+        logX_line = np.linspace(x_log_min, x_log_max, 200)
+        logY_line = logX_line + ratio_log
+    
+    if B1 is not None and L is not None:
+        ratio1_log = np.log10((B1 ** 2) / (L ** 2))
+        logX_line1 = np.linspace(x_log_min, x_log_max, 200)
+        logY_line1 = logX_line1 + ratio1_log
+    
+    if anis is not None:
+        ratio_anis_log = np.log10((np.sqrt(anis)))
+        logX_line_anis = np.linspace(x_log_min, x_log_max, 200)
+        logY_line_anis = logX_line_anis + ratio_anis_log
+
+    # --- Helpers ---
+    def _clean_axes(ax):
+        ax.set_facecolor("white")
+        for s in ax.spines.values():
+            s.set_visible(True)
+            s.set_color("black")
+            s.set_linewidth(1)
+        ax.tick_params(direction="out", colors="black", labelsize=11)
+        return ax
+
+    def log_formatter(val, pos):
+        return rf"$10^{{{int(val)}}}$"
+
+    def fmt_pow10(val):
+        return f"{int(10 ** val):g}"
+
+    def format_cb(cb):
+        ticks = np.arange(vmin, vmax + 1)
+        cb.set_ticks(ticks)
+        cb.ax.set_yticklabels([f"{int(10 ** i):,}" for i in ticks])
+        cb.set_label(z_label, fontsize=11)
+
+    def add_ratio_legend(cb):
+        h = Line2D([0], [0], color="red", linestyle="--", linewidth=1,
+                   label=r"$Y/X = B^2/L^2$")
+        cb.ax.legend(handles=[h], loc="upper left",
+                     bbox_to_anchor=(0, -0.05), fontsize=10)
+
+    # ============================
+    # Regression plot
+    # ============================
+    if regression:
+
+        fig1, ax1 = plt.subplots(figsize=(6, 6.5), dpi=100)
+
+        cf1 = ax1.contourf(
+            Xg, Yg, Z_pred,
+            levels=levels_fill, cmap="viridis",
+            vmin=vmin, vmax=vmax, extend="both"
+        )
+
+        cont1 = ax1.contour(
+            Xg, Yg, Z_pred,
+            levels=levels_contour,
+            colors="black", linewidths=0.6, linestyles="dashed"
+        )
+        ax1.clabel(cont1, fmt=fmt_pow10, fontsize=10)
+
+        ax1.scatter(
+            d["logX"], d["logY"],
+            c=d["logZ"], cmap="viridis",
+            vmin=vmin, vmax=vmax,
+            s=40, edgecolors="black", linewidths=0.5
+        )
+
+        if B is not None and L is not None:
+            ax1.plot(logX_line, logY_line, "r--", lw=1)
+        
+        if B1 is not None and L is not None:
+            ax1.plot(logX_line1, logY_line1, "b--", lw=1)   
+        
+        if anis is not None:       
+            ax1.plot(logX_line_anis, logY_line_anis, "g--", lw=1)
+
+        ax1 = _clean_axes(ax1)
+        ax1.set_aspect("equal")
+        ax1.set_xlim(x_log_min, x_log_max)
+        ax1.set_ylim(y_log_min, y_log_max)
+        ax1.xaxis.set_major_formatter(FuncFormatter(log_formatter))
+        ax1.yaxis.set_major_formatter(FuncFormatter(log_formatter))
+        ax1.set_xlabel(x_label)
+        ax1.set_ylabel(y_label)
+
+        cb1 = fig1.colorbar(cf1, ax=ax1, shrink=0.85)
+        format_cb(cb1)
+        if B is not None and L is not None:
+            add_ratio_legend(cb1)
+
+        plt.tight_layout()
+        if SAVE and output_path_regression is not None:
+            plt.savefig(output_path_regression, dpi=300)
+        else:
+            plt.show()
+
+    # ============================
+    # Interpolated plot
+    # ============================
+    fig2, ax2 = plt.subplots(figsize=(6, 6.5), dpi=200)
+
+    cf2 = ax2.contourf(
+        Xg, Yg, Z_interp_filled,
+        levels=levels_fill, cmap="viridis",
+        vmin=vmin, vmax=vmax, extend="both"
+    )
+
+    cont2 = ax2.contour(
+        Xg, Yg, Z_interp_filled,
+        levels=levels_contour,
+        colors="black", linewidths=0.6, linestyles="dashed"
+    )
+    ax2.clabel(cont2, fmt=fmt_pow10, fontsize=10)
+
+    ax2.scatter(
+        d["logX"], d["logY"],
+        c=d["logZ"], cmap="viridis",
+        vmin=vmin, vmax=vmax,
+        s=40, edgecolors="black", linewidths=0.5
+    )
+
+    if B is not None and L is not None:
+        ax2.plot(logX_line, logY_line, "r--", lw=1)
+    
+    if B1 is not None and L is not None:
+        ax2.plot(logX_line1, logY_line1, "b--", lw=1)
+    
+    if anis is not None:       
+        ax2.plot(logX_line_anis, logY_line_anis, "g--", lw=1)
+
+    ax2 = _clean_axes(ax2)
+    ax2.set_aspect("equal")
+    ax2.set_xlim(x_log_min, x_log_max)
+    ax2.set_ylim(y_log_min, y_log_max)
+    ax2.xaxis.set_major_formatter(FuncFormatter(log_formatter))
+    ax2.yaxis.set_major_formatter(FuncFormatter(log_formatter))
+    ax2.set_xlabel(x_label)
+    ax2.set_ylabel(y_label)
+
+    cb2 = fig2.colorbar(cf2, ax=ax2, shrink=0.85)
+    format_cb(cb2)
+    if B is not None and L is not None:
+        add_ratio_legend(cb2)
+
+    plt.tight_layout()
+    if SAVE and output_path_interpolation is not None:
+        plt.savefig(output_path_interpolation, dpi=300)
+    else:
+        plt.show()
+
+    return {
+        "a": a,
+        "b": b,
+        "c": c,
+        "K": K,
+        "R2": r2,
+        "model": model,
+        "X_grid": Xgrid,
+        "Y_grid": Ygrid,
+        "Z_pred": Z_pred,
+        "Z_interp": Z_interp_filled,
+    }
