@@ -32,6 +32,8 @@ import re
 from pathlib import Path
 import shutil
 import subprocess
+import gc
+import time
 from mlibs import modplot6 # type: ignore
 
 def simplify_name(name):
@@ -1281,8 +1283,31 @@ def analyze_cbb_boundaries(
     Read a MODFLOW 6 cell budget file and compute per-time-step SNAPSHOT
     statistics for all DRN, GHB, RIV and CHD packages found inside it.
 
-    For each package and each time step the following columns are written,
-    where <PKG> is the raw MODFLOW 6 record name (e.g. "DRN", "GHB", "GHB-1"):
+    MULTIPLE PACKAGES OF THE SAME TYPE (e.g. drn1..drn5, ghb1, ghb2):
+    MF6 writes these under a shared generic record "text" (e.g. "DRN"),
+    so cb.get_unique_record_names() / a plain text-based read only ever
+    sees "DRN" once, not five times. Per the MF6 IO documentation, list-
+    based boundary flow records are written with IMETH=6, which includes
+    four text identifiers: TXT1ID1, TXT2ID1, TXT1ID2, TXT2ID2. For GWF
+    boundary packages, TXT1ID1 and TXT2ID1 are both just the GWF model
+    name, and TXT2ID2 is "the package or model name" - i.e. the actual
+    package instance name (e.g. "DRN1", "DRN2", ...).
+
+    flopy exposes these as columns on `cb.headers`:
+        modelnam  <- TXT1ID1 (model name)
+        paknam    <- TXT2ID1 (ALSO model name - NOT the package name)
+        modelnam2 <- TXT1ID2 (model name)
+        paknam2   <- TXT2ID2 (the actual package instance name)
+
+    So this function reads the package instance name from `paknam2`
+    (not `paknam`) and uses it to label columns, giving one full set of
+    stats per package instance (e.g. DRN1_*, ..., DRN5_*, GHB1_*, GHB2_*)
+    instead of collapsing them into one generic <TEXT>_* block.
+
+    For each package instance and each time step the following columns
+    are written, where <PKG> is the resolved paknam2 (falling back to
+    the record text if paknam2 is blank, e.g. for a model with only one
+    instance of that package type):
 
     NET statistics  (all cells in the package)
     -------------------------------------------
@@ -1290,7 +1315,7 @@ def analyze_cbb_boundaries(
     <PKG>_net_total     Sum of all cell flows.
     <PKG>_net_mean      Mean flow per cell.
     <PKG>_net_median    Median flow per cell.
-    <PKG>_net_std       Standard deviation of flows.
+    <PKG>_net_std       Standard deviation of flows (population, ddof=0).
     <PKG>_net_5pct      5th percentile of flows.
     <PKG>_net_95pct     95th percentile of flows.
     <PKG>_net_min       Minimum flow (most negative).
@@ -1325,6 +1350,10 @@ def analyze_cbb_boundaries(
     <PKG>_in_min        Minimum among inflow cells.
     <PKG>_in_max        Maximum among inflow cells.
 
+    Note: <PKG>_net_pct is intentionally omitted (it is always 100% and
+    carries no information), for every time step including ones where a
+    package returned no data.
+
     Parameters
     ----------
     cbb_path : str
@@ -1347,20 +1376,60 @@ def analyze_cbb_boundaries(
     # ---------------------------------------------------------------------- #
     cb = flopy.utils.CellBudgetFile(cbb_path, precision="double")
     all_kstpkper = cb.get_kstpkper()
-    unique_texts = [t.strip().decode("utf-8") for t in cb.get_unique_record_names()]
+    times = cb.get_times()
+
+    if len(times) != len(all_kstpkper):
+        print(
+            f"[analyze_cbb] WARNING - get_times() length ({len(times)}) does not "
+            f"match get_kstpkper() length ({len(all_kstpkper)}); totim values may "
+            f"be misaligned."
+        )
 
     # ---------------------------------------------------------------------- #
-    # 2. Discover DRN, GHB, RIV and CHD package records
+    # 2. Discover DRN, GHB, RIV and CHD package INSTANCES via paknam2
     # ---------------------------------------------------------------------- #
-    drn_texts = sorted({t for t in unique_texts if t.upper().startswith("DRN")})
-    ghb_texts = sorted({t for t in unique_texts if t.upper().startswith("GHB")})
-    riv_texts = sorted({t for t in unique_texts if t.upper().startswith("RIV")})
-    chd_texts = sorted({t for t in unique_texts if t.upper().startswith("CHD")})
+    def _clean_str(val) -> str:
+        if isinstance(val, bytes):
+            val = val.decode("utf-8", errors="ignore")
+        return str(val).replace("\x00", "").strip()
 
-    print(f"[analyze_cbb] DRN records found: {drn_texts}")
-    print(f"[analyze_cbb] GHB records found: {ghb_texts}")
-    print(f"[analyze_cbb] RIV records found: {riv_texts}")
-    print(f"[analyze_cbb] CHD records found: {chd_texts}")
+    hdr = cb.headers  # pandas DataFrame of every record header in the file
+
+    hdr_text = hdr["text"].apply(_clean_str)
+    if "paknam2" in hdr.columns:
+        hdr_paknam2 = hdr["paknam2"].apply(_clean_str)
+    else:
+        # Very old flopy without paknam2: no way to split instances.
+        print(
+            "[analyze_cbb] WARNING - cb.headers has no 'paknam2' column "
+            "(old flopy version?). Multi-instance packages of the same "
+            "type cannot be distinguished; only the first instance's "
+            "cells will be read per text. Consider upgrading flopy."
+        )
+        hdr_paknam2 = pd.Series([""] * len(hdr), index=hdr.index)
+
+    combos = pd.DataFrame({"text": hdr_text, "paknam2": hdr_paknam2}).drop_duplicates()
+
+    def _discover(prefix: str) -> list:
+        """Return list of (text, paknam2, column_label) for a package prefix."""
+        subset = combos[combos["text"].str.upper().str.startswith(prefix)]
+        instances = []
+        for _, r in subset.sort_values(["text", "paknam2"]).iterrows():
+            txt, pak2 = r["text"], r["paknam2"]
+            label = pak2 if pak2 else txt
+            instances.append((txt, pak2, label))
+        return instances
+
+    package_groups = {
+        "DRN": _discover("DRN"),
+        "GHB": _discover("GHB"),
+        "RIV": _discover("RIV"),
+        "CHD": _discover("CHD"),
+    }
+
+    for prefix, instances in package_groups.items():
+        labels = [lbl for _, _, lbl in instances]
+        print(f"[analyze_cbb] {prefix} package instances found: {labels}")
 
     # ---------------------------------------------------------------------- #
     # 3. Helper: compute stats + count for flows[mask] under column prefix
@@ -1372,7 +1441,7 @@ def analyze_cbb_boundaries(
         if count == 0:
             return {
                 f"{prefix}_count":  0,
-                f"{prefix}_pct":    0.0,
+                f"{prefix}_pct":    pct,
                 **{f"{prefix}_{s}": np.nan for s in
                    ["total", "mean", "median", "std", "5pct", "95pct", "min", "max"]},
             }
@@ -1390,30 +1459,36 @@ def analyze_cbb_boundaries(
         }
 
     # ---------------------------------------------------------------------- #
-    # 4. Helper: build all columns for one package at one time step
+    # 4. Helper: build all columns for one package instance at one time step
     # ---------------------------------------------------------------------- #
-    def package_row(txt: str, data: list) -> dict:
+    def package_row(label: str, data: list) -> dict:
         if len(data) == 0:
-            base = {f"{txt}_net_count": 0, f"{txt}_net_pct": np.nan}
+            base = {f"{label}_net_count": 0}
             for s in ["total", "mean", "median", "std", "5pct", "95pct", "min", "max"]:
-                base[f"{txt}_net_{s}"] = np.nan
-            for prefix in [f"{txt}_out", f"{txt}_in"]:
+                base[f"{label}_net_{s}"] = np.nan
+            for prefix in [f"{label}_out", f"{label}_in"]:
                 base[f"{prefix}_count"] = 0
                 base[f"{prefix}_pct"]   = np.nan
                 for s in ["total", "mean", "median", "std", "5pct", "95pct", "min", "max"]:
                     base[f"{prefix}_{s}"] = np.nan
             return base
 
+        if len(data) > 1:
+            print(
+                f"  [warn] {label} returned {len(data)} record arrays for this "
+                f"time step even after filtering by paknam2; only the first "
+                f"is used. Verify paknam2 values are unique per instance."
+            )
+
         flows = _extract_flows(data[0])
         n_cells = len(flows)
 
-        row = {f"{txt}_net_count": n_cells}
-        row.update(flow_stats(flows, np.ones(n_cells, dtype=bool), f"{txt}_net", n_cells))
-        row.update(flow_stats(flows, flows < 0.0,                   f"{txt}_out", n_cells))
-        row.update(flow_stats(flows, flows >= 0.0,                  f"{txt}_in",  n_cells))
+        row = {f"{label}_net_count": n_cells}
+        row.update(flow_stats(flows, np.ones(n_cells, dtype=bool), f"{label}_net", n_cells))
+        row.update(flow_stats(flows, flows < 0.0,                   f"{label}_out", n_cells))
+        row.update(flow_stats(flows, flows >= 0.0,                  f"{label}_in",  n_cells))
 
-        # net has no meaningful pct (it's always 100%), remove it
-        row.pop(f"{txt}_net_pct", None)
+        row.pop(f"{label}_net_pct", None)  # net is always 100%, no info
 
         return row
 
@@ -1422,47 +1497,24 @@ def analyze_cbb_boundaries(
     # ---------------------------------------------------------------------- #
     rows = []
 
-    for kstp, kper in all_kstpkper:
+    for i, (kstp, kper) in enumerate(all_kstpkper):
         kstpkper = (kstp, kper)
-
-        try:
-            totim = cb.get_times()[all_kstpkper.index(kstpkper)]
-        except Exception:
-            totim = np.nan
+        totim = times[i] if i < len(times) else np.nan
 
         row = {"run": run_label, "kper": kper, "kstp": kstp, "totim": totim}
 
-        for txt in drn_texts:
-            try:
-                data = cb.get_data(text=txt, kstpkper=kstpkper)
-                row.update(package_row(txt, data))
-            except Exception as e:
-                print(f"  [warn] Could not read {txt} at {kstpkper}: {e}")
-                row.update(package_row(txt, []))
-
-        for txt in ghb_texts:
-            try:
-                data = cb.get_data(text=txt, kstpkper=kstpkper)
-                row.update(package_row(txt, data))
-            except Exception as e:
-                print(f"  [warn] Could not read {txt} at {kstpkper}: {e}")
-                row.update(package_row(txt, []))
-
-        for txt in riv_texts:
-            try:
-                data = cb.get_data(text=txt, kstpkper=kstpkper)
-                row.update(package_row(txt, data))
-            except Exception as e:
-                print(f"  [warn] Could not read {txt} at {kstpkper}: {e}")
-                row.update(package_row(txt, []))
-
-        for txt in chd_texts:
-            try:
-                data = cb.get_data(text=txt, kstpkper=kstpkper)
-                row.update(package_row(txt, data))
-            except Exception as e:
-                print(f"  [warn] Could not read {txt} at {kstpkper}: {e}")
-                row.update(package_row(txt, []))
+        for prefix, instances in package_groups.items():
+            for txt, pak2, label in instances:
+                try:
+                    data = cb.get_data(
+                        text=txt,
+                        kstpkper=kstpkper,
+                        paknam2=pak2 if pak2 else None,
+                    )
+                    row.update(package_row(label, data))
+                except Exception as e:
+                    print(f"  [warn] Could not read {label} ({txt}) at {kstpkper}: {e}")
+                    row.update(package_row(label, []))
 
         rows.append(row)
 
@@ -1474,6 +1526,10 @@ def analyze_cbb_boundaries(
     if run_label is None:
         df.drop(columns=["run"], inplace=True)
 
+    out_dir = os.path.dirname(csv_out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     df.to_csv(csv_out, mode="w", header=True, index=False)
     print(f"[analyze_cbb] Results written to: {csv_out}")
 
@@ -1482,9 +1538,8 @@ def analyze_cbb_boundaries(
     # ---------------------------------------------------------------------- #
     cb.close()
     del cb
-    import gc
     gc.collect()
-    import time
+
     if delete_cbb:
         for attempt in range(10):
             try:
@@ -1494,7 +1549,7 @@ def analyze_cbb_boundaries(
             except OSError:
                 time.sleep(0.5)
         else:
-            print(f"[analyze_cbb] WARNING – could not delete {cbb_path} after 10 attempts")
+            print(f"[analyze_cbb] WARNING - could not delete {cbb_path} after 10 attempts")
 
     return df
 
