@@ -606,9 +606,7 @@ def estimate_sustainable_yield(
             - "id" (str): Unique identifier for the constraint.
             - "constrain" (str): Component acting as constrain ("LEAKAGE", "DRN", "RIV", "GHB", etc).
             - "flow" (str): Flow type ("IN", "OUT", "NET", "CBB"). If "NET" the net outflow is considered (OUT - IN).
-                If "CBB", the flow is considered reversed if the net flow is positive (i.e. inflow to the system).
-                The threshold is then an allowed number of cells with reversed flow at each time step or the minimum
-                allowed outflow in a single cell.
+                If "CBB", constraints from the cell budget file analysis are considered.
             Positive values indicate outflow from the system, negative values indicate inflow to the system.
             - "zone" (str): Zone ID or "ALL" for the constraint.
             - "threshold_type" (str): Type of threshold ("ABSOLUTE" or "RELATIVE").
@@ -844,7 +842,7 @@ def estimate_sustainable_yield(
 
             # ---------- FLOW with zone == "ALL" (use aggregated budget) ----------
             elif zone == "ALL" and budget_df is not None:
-                out_col, in_col = f"{c['constrain']}_OUT", f"{c['constrain']}_IN"
+                out_col, in_col = f"{constr}_OUT", f"{constr}_IN"
                 if "totim" not in budget_df.columns:
                     continue
                 closest_idx = (budget_df["totim"] - time_target).abs().idxmin()
@@ -976,7 +974,7 @@ def estimate_sustainable_yield(
     ax.set_xlabel("Pumping Rate")
     ax.set_ylabel("Flow Rate")
     ax2.set_ylabel("Head")
-    ax.set_xlim(left=0, right=min(df["PumpingRate"].max() * 1.1, qs_value * 2 if qs_value is not None else 1))
+    ax.set_xlim(left=0, right=min(df["PumpingRate"].max() * 1.1, qs_value * 2 if qs_value is not None else df["PumpingRate"].max() * 1.1))
     # ax.set_yscale('log')
 
     # combined legend (flows + heads + thresholds)
