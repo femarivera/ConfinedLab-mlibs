@@ -587,7 +587,11 @@ def estimate_sustainable_yield(
     csv_filename: str = "flow_summary.csv",
     plot_filename: str = "Q_vs_flow.png",
     plot_units: str = None,
-    conversion_factor: float = 1.0
+    conversion_factor: float = 1.0,
+    verbose: bool = False,
+    enforce_time_target_coverage: bool = True,
+    time_target_tolerance: float = 30,
+    crossing_rel_tol: float = 1e-6,
 ):
     """
     Estimates the sustainable yield for a groundwater system using MODFLOW 6 zonebud simulation results.
@@ -620,11 +624,38 @@ def estimate_sustainable_yield(
             - "neighbour_zones" (list, optional): List of neighboring zones for leakage constraints. Just used when
             "constrain" is "LEAKAGE".
             - "color" (str, optional): Color for plotting the constraint.
+            - "tolerance" (float, optional): Absolute tolerance, in this constraint's own units,
+            for deciding it has "reached" its threshold when the series plateaus at/near the
+            threshold instead of crossing past it. If omitted, scaled automatically from
+            crossing_rel_tol (see below).
         csv_filename (str): Name of the output CSV file summarizing results.
         plot_filename (str): Name of the output plot file.
         plot_units (str, optional): "years" or None. If "years", it assumes model time units are days and converts to years for plotting.
         conversion_factor (float): Factor to convert time units to years, used for plotting.
         If None, does not customize model time units.
+        verbose (bool): If True, emits warnings.warn() diagnostics for scenarios/constraints that are
+            silently skipped (missing columns, unreadable files, missing pairs, etc). Default False
+            preserves the original silent behavior exactly.
+        enforce_time_target_coverage (bool): If True (default), a scenario's simulation output must
+            actually extend to (or past) time_target = pump_start + planning_horizon before its
+            "closest available time step" is accepted as a data point for a constraint. If the
+            relevant data source (zonebudget, aggregated budget, head, or cbb summary file) ends
+            earlier than time_target, that data source's last time step is NOT used as a stand-in
+            for the target time — the point is skipped instead (with a warning if verbose=True).
+            This prevents e.g. a run that stops at day 30 from silently having its day-30 values
+            treated as representative of a 365-day planning horizon. Set to False to restore the
+            original behavior of always using the closest available time step regardless of coverage.
+        time_target_tolerance (float): Allowed shortfall (in model time units) between a data
+            source's last available totim and time_target before it's considered "not covering"
+            the target time. Use a small positive value to tolerate output-interval rounding
+            (e.g. last step at 364.9 vs a target of 365). Default 0.0 requires the data to reach
+            or exceed time_target exactly. Ignored if enforce_time_target_coverage is False.
+        crossing_rel_tol (float): Default relative tolerance (as a fraction of each constraint's
+            own data magnitude) used to decide whether a series has "reached" its threshold when
+            it approaches monotonically and plateaus there rather than crossing past it (e.g. a
+            flow component that decays toward, and flattens at, its threshold instead of
+            overshooting it). Scaled per-constraint automatically; override per-constraint with
+            an explicit "tolerance" key (absolute units) in that constraint's dict.
 
     Returns:
         qs_value (float): Estimated sustainable yield value for the specified system.
@@ -650,9 +681,39 @@ def estimate_sustainable_yield(
     Naming conventions:
       Zonebudget file columns:  <pname>-<ptype>-IN/OUT  or  <ptype>-IN/OUT
       Budget file columns:      <ptype>(<pname>)_IN/OUT
+
+    Performance notes (does not affect results):
+      • Nearest-time-index lookups ("closest row to time_target") are cached per (file, source, zone)
+        instead of being recomputed for every constraint that shares the same zone/dataframe.
+      • When "totim" is sorted ascending (the normal case for MODFLOW time series), the nearest-index
+        lookup uses an O(log n) binary search instead of an O(n) full-column scan, with tie-breaking
+        that exactly matches the original .abs().idxmin() behavior. Falls back to the original
+        idxmin-based approach automatically if the column is not sorted.
+      • The final results DataFrame is assembled with a single pd.concat instead of one pd.merge
+        per constraint.
+
+    Time-target coverage check:
+      time_target = pump_start + planning_horizon is when constraints are evaluated. A scenario's
+      simulation may end before time_target (e.g. it stopped at day 30 while the planning horizon
+      is 1 year). In that case the "closest available time step" would actually be the last step
+      of an incomplete run, not a representative value at the target time. When
+      enforce_time_target_coverage=True (default), such points are detected and excluded rather
+      than silently used. See the enforce_time_target_coverage / time_target_tolerance args above.
+
+    Threshold crossing detection:
+      A constraint doesn't always cross its threshold with a clean sign change -- some flow
+      components decay/grow monotonically with pumping rate and then plateau at a bounding value
+      that coincides with the threshold (e.g. a spring that dries out, flattening at 0, or at
+      some other physical floor/ceiling) rather than overshooting past it. find_threshold_crossing
+      treats the constraint as "reached" either on a true sign flip (as before) or on landing
+      within tolerance of the threshold, whichever comes first when scanning away from the
+      reference (natural-conditions) point. See crossing_rel_tol / the per-constraint "tolerance"
+      key above.
     """
 
     import os
+    import warnings
+    import numpy as np
     import pandas as pd
     import matplotlib.pyplot as plt
     from typing import Optional
@@ -662,16 +723,96 @@ def estimate_sustainable_yield(
     os.makedirs(output_folder, exist_ok=True)
     os.makedirs(plot_folder, exist_ok=True)
 
-    # --- helper: find where constraint crosses threshold ---
-    def find_threshold_crossing(x, y, threshold=0):
-        for i in range(len(y) - 1):
-            if pd.isna(y[i]) or pd.isna(y[i + 1]):
+    def _warn(msg):
+        if verbose:
+            warnings.warn(msg)
+
+    # --- helper: find where constraint reaches/crosses threshold ---
+    def find_threshold_crossing(x, y, threshold=0, tol=0.0):
+        """
+        Finds the pumping rate (x) at which the series y first reaches the threshold,
+        relative to its side at the first valid (reference/natural-conditions) point.
+
+        Generalizes the classic "strict sign change" crossing test to also catch a
+        series that approaches the threshold monotonically and then plateaus at (or
+        within `tol` of) it, without ever overshooting to the other side -- e.g. a
+        flow component that decays from -500 toward 0 and flattens out at 0 rather
+        than continuing past it. In that case there is no sign flip to detect, but
+        the constraint has still been reached.
+
+        Cases handled:
+          1. Strict sign change (y crosses from one side of threshold to the other)
+             -> same interpolated result as the original implementation.
+          2. Monotonic approach to a plateau at/within `tol` of the threshold
+             -> the first point landing within tolerance is reported as the crossing.
+          3. Series stays on one side throughout -> returns None (never binds).
+          4. The reference point itself is already at/within tolerance of the
+             threshold, AND the series later moves meaningfully (beyond tol) away
+             from that reference value -> returns x at the reference point (no
+             headroom at all from the start).
+          5. The reference point is at/within tolerance of the threshold and the
+             rest of the series stays within tol of it too (a static/flat line,
+             or noise-level wobble) -> returns None. This is NOT treated as a
+             binding constraint: it isn't actually responding to pumping, it just
+             happens to sit at the threshold value, so it's ignored rather than
+             reported as an artificial Qs=0 crossing.
+
+        NaNs are skipped when looking for the next comparison point rather than
+        blocking detection outright, so a crossing spanning a gap of missing data
+        is still found (the original implementation could miss crossings adjacent
+        to NaNs).
+
+        `tol` is in the same units as y; it should be scaled to the magnitude of
+        that specific series (a flow constraint and a head constraint need very
+        different absolute tolerances). See the tolerance handling where this is
+        called, a few lines below.
+        """
+        d = [(yi - threshold) if not pd.isna(yi) else None for yi in y]
+        ref_idx = next((i for i, di in enumerate(d) if di is not None), None)
+        if ref_idx is None:
+            return None
+
+        if abs(d[ref_idx]) <= tol:
+            # Reference point is already at/near the threshold. Only treat this as a
+            # genuine binding constraint if the series actually moves in response to
+            # pumping; if every later value stays within tol of the reference (a flat
+            # line, or pure noise around it), the constraint is static/unaffected and
+            # should be ignored rather than flagged as an immediate crossing at Q=0.
+            remaining = [di for di in d[ref_idx + 1:] if di is not None]
+            if not remaining or max(abs(v - d[ref_idx]) for v in remaining) <= tol:
+                return None
+            return x[ref_idx]
+
+        prev_i, prev_d = ref_idx, d[ref_idx]
+        for i in range(ref_idx + 1, len(y)):
+            di = d[i]
+            if di is None:
                 continue
-            if (y[i] - threshold) * (y[i + 1] - threshold) < 0:
-                x0, x1 = x[i], x[i + 1]
-                y0, y1 = y[i] - threshold, y[i + 1] - threshold
+            if abs(di) <= tol:
+                # landed on (or within tolerance of) the threshold -> plateau reached
+                return x[i]
+            if (di > 0) != (prev_d > 0):
+                # true sign flip -> interpolate exactly as the original logic did
+                x0, x1 = x[prev_i], x[i]
+                y0, y1 = prev_d, di
                 return x0 - y0 * (x1 - x0) / (y1 - y0)
+            prev_i, prev_d = i, di
+
         return None
+
+    # --- helper: nearest-time index, O(log n) when sorted, else identical to original .abs().idxmin() ---
+    def nearest_time_idx(series, target):
+        if series.is_monotonic_increasing:
+            arr = series.values
+            pos = np.searchsorted(arr, target)
+            if pos <= 0:
+                return series.index[0]
+            if pos >= len(arr):
+                return series.index[-1]
+            before, after = arr[pos - 1], arr[pos]
+            # tie-break matches idxmin's "first occurrence of the minimum" behavior
+            return series.index[pos - 1] if (target - before) <= (after - target) else series.index[pos]
+        return (series - target).abs().idxmin()
 
     # --- helper: paired head_obs file ---
     def paired_head_file(zonebud_filename: str) -> Optional[str]:
@@ -717,10 +858,12 @@ def estimate_sustainable_yield(
         file_path = os.path.join(input_folder, file_name)
         try:
             data = pd.read_csv(file_path)
-        except Exception:
+        except Exception as e:
+            _warn(f"Skipping {file_name}: failed to read zonebudget file ({e})")
             continue
 
         if "totim" not in data.columns or "WEL-OUT" not in data.columns:
+            _warn(f"Skipping {file_name}: missing required columns 'totim'/'WEL-OUT'")
             continue
 
         # --- try to pair related files ---
@@ -738,8 +881,10 @@ def estimate_sustainable_yield(
                         tmp = tmp.rename(columns={alt: "totim"})
                 if "totim" in tmp.columns:
                     heads_df = tmp
-            except Exception:
-                pass
+                else:
+                    _warn(f"{head_path}: no time column found, ignoring head file")
+            except Exception as e:
+                _warn(f"Failed to read paired head file {head_path}: {e}")
 
         # --- load aggregated budget file ---
         if budget_path and os.path.isfile(budget_path):
@@ -748,8 +893,8 @@ def estimate_sustainable_yield(
                 # rename "time" -> "totim" for consistency
                 if "time" in budget_df.columns and "totim" not in budget_df.columns:
                     budget_df = budget_df.rename(columns={"time": "totim"})
-            except Exception:
-                pass
+            except Exception as e:
+                _warn(f"Failed to read paired budget file {budget_path}: {e}")
 
         # --- load cbb summary file (for CBB constraints) ---
         cbb_summary_path = paired_cbb_summary_file(file_name)
@@ -760,12 +905,13 @@ def estimate_sustainable_yield(
                 for alt in ["time", "Time", "TIME"]:
                     if "totim" not in cbb_summary_df.columns and alt in cbb_summary_df.columns:
                         cbb_summary_df = cbb_summary_df.rename(columns={alt: "totim"})
-            except Exception:
-                pass
+            except Exception as e:
+                _warn(f"Failed to read paired cbb summary file {cbb_summary_path}: {e}")
 
         # --- filter post-pumping period ---
         pump_data = data[data["totim"] >= pump_start].copy()
         if pump_data.empty:
+            _warn(f"{file_name}: no rows at/after pump_start={pump_start}, skipping")
             continue
 
         # --- compute pumping rate ---
@@ -783,12 +929,47 @@ def estimate_sustainable_yield(
             if "zone" in pump_data.columns:
                 pump_series = pump_data.loc[pump_data["zone"] == pump_zone, "WEL-OUT"]
             else:
+                _warn(f"{file_name}: no 'zone' column, cannot isolate pump_zone={pump_zone}")
                 continue
 
         if pump_series.empty:
+            _warn(f"{file_name}: pump_series empty for pump_zone={pump_zone}")
             continue
 
         Q_code = float(pd.to_numeric(pump_series, errors="coerce").mean())
+
+        # --- per-file caches: reused across constraints that share a zone/dataframe ---
+        zone_subset_cache = {}
+        idx_cache = {}
+        time_filtered_cache = {}
+
+        def get_zone_subset(zone):
+            key = zone
+            if key not in zone_subset_cache:
+                zone_subset_cache[key] = data if zone == "ALL" else data[data["zone"] == zone]
+            return zone_subset_cache[key]
+
+        def get_nearest_idx(source_key, df_or_series):
+            """Returns (closest_idx, covered, max_totim). 'covered' is True if this source's
+            simulation output actually reaches time_target (within time_target_tolerance)."""
+            if source_key not in idx_cache:
+                totim_series = df_or_series["totim"]
+                idx = nearest_time_idx(totim_series, time_target)
+                max_totim = float(totim_series.max())
+                covered = max_totim >= (time_target - time_target_tolerance)
+                idx_cache[source_key] = (idx, covered, max_totim)
+            return idx_cache[source_key]
+
+        def accept_point(source_label, cid, covered, max_totim):
+            """Returns True if this data point should be kept, given coverage settings."""
+            if covered or not enforce_time_target_coverage:
+                return True
+            _warn(
+                f"{file_name}: constraint '{cid}' skipped — {source_label} data ends at "
+                f"totim={max_totim}, short of time_target={time_target} "
+                f"(pump_start={pump_start} + planning_horizon={planning_horizon})"
+            )
+            return False
 
         # --- evaluate all constraints for this scenario ---
         for c in constraints:
@@ -803,7 +984,9 @@ def estimate_sustainable_yield(
                 head_col = c.get("head_obs")
                 if heads_df is None or head_col not in heads_df.columns:
                     continue
-                closest_idx = (heads_df["totim"] - time_target).abs().idxmin()
+                closest_idx, covered, max_totim = get_nearest_idx(("heads",), heads_df)
+                if not accept_point("head observation file", cid, covered, max_totim):
+                    continue
                 value = heads_df.loc[closest_idx, head_col]
                 if pd.notna(value):
                     results[cid].append((Q_code, float(value)))
@@ -816,7 +999,9 @@ def estimate_sustainable_yield(
                 pkg_col = c["constrain"]   # raw MODFLOW name e.g. "DRN", "GHB"
                 if pkg_col not in cbb_summary_df.columns or "totim" not in cbb_summary_df.columns:
                     continue
-                closest_idx = (cbb_summary_df["totim"] - time_target).abs().idxmin()
+                closest_idx, covered, max_totim = get_nearest_idx(("cbb",), cbb_summary_df)
+                if not accept_point("cbb summary file", cid, covered, max_totim):
+                    continue
                 value = cbb_summary_df.loc[closest_idx, pkg_col]
                 if pd.notna(value):
                     results[cid].append((Q_code, float(value)))
@@ -824,12 +1009,14 @@ def estimate_sustainable_yield(
 
             # ---------- LEAKAGE constraint ----------
             if constr == "LEAKAGE":
-                subset = data if zone == "ALL" else data[data["zone"] == zone]
+                subset = get_zone_subset(zone)
                 nz = c.get("neighbour_zones") or []
                 required_cols = set([f"TO ZONE {z}" for z in nz] + [f"FROM ZONE {z}" for z in nz] + ["totim"])
                 if not required_cols.issubset(subset.columns):
                     continue
-                closest_idx = (subset["totim"] - time_target).abs().idxmin()
+                closest_idx, covered, max_totim = get_nearest_idx(("data", zone), subset)
+                if not accept_point("zonebudget file", cid, covered, max_totim):
+                    continue
                 row = subset.loc[closest_idx]
                 to_sum = float(sum(row.get(f"TO ZONE {z}", 0.0) for z in nz))
                 from_sum = float(sum(row.get(f"FROM ZONE {z}", 0.0) for z in nz))
@@ -845,7 +1032,9 @@ def estimate_sustainable_yield(
                 out_col, in_col = f"{constr}_OUT", f"{constr}_IN"
                 if "totim" not in budget_df.columns:
                     continue
-                closest_idx = (budget_df["totim"] - time_target).abs().idxmin()
+                closest_idx, covered, max_totim = get_nearest_idx(("budget",), budget_df)
+                if not accept_point("aggregated budget file", cid, covered, max_totim):
+                    continue
                 row = budget_df.loc[closest_idx]
                 if flow == "OUT" and out_col in budget_df.columns:
                     value = float(row[out_col])
@@ -856,14 +1045,18 @@ def estimate_sustainable_yield(
 
             # ---------- FLOW per-zone (use zonebudget) ----------
             else:
-                subset = data if zone == "ALL" else data[data["zone"] == zone]
+                subset = get_zone_subset(zone)
                 out_col, in_col = f"{constr}-OUT", f"{constr}-IN"
                 if "totim" not in subset.columns:
                     continue
-                closest_idx = (subset["totim"] - time_target).abs().idxmin()
+                closest_idx, covered, max_totim = get_nearest_idx(("data", zone), subset)
+                if not accept_point("zonebudget file", cid, covered, max_totim):
+                    continue
                 if zone == "ALL":
-                    closest_time = subset.loc[closest_idx, "totim"]
-                    time_filtered = subset[subset["totim"] == closest_time]
+                    if zone not in time_filtered_cache:
+                        closest_time = subset.loc[closest_idx, "totim"]
+                        time_filtered_cache[zone] = subset[subset["totim"] == closest_time]
+                    time_filtered = time_filtered_cache[zone]
                     if flow == "OUT" and out_col in subset.columns:
                         value = float(time_filtered[out_col].sum())
                     elif flow == "IN" and in_col in subset.columns:
@@ -882,18 +1075,38 @@ def estimate_sustainable_yield(
             # --- store the value ---
             if value is not None and pd.notna(value):
                 results[cid].append((Q_code, float(value)))
+            elif value is None:
+                _warn(f"{file_name}: constraint '{cid}' produced no value (flow={flow}, constrain={constr}, zone={zone})")
 
-    # --- assemble DataFrame with all results ---
+    # --- assemble DataFrame with all results (single concat instead of per-constraint merge) ---
     for cid in results:
         results[cid].sort(key=lambda x: x[0])
     pumping_rates = sorted({x[0] for vals in results.values() for x in vals})
-    df = pd.DataFrame({"PumpingRate": pumping_rates})
+
+    base = pd.DataFrame({"PumpingRate": pumping_rates}).set_index("PumpingRate")
+    constraint_series = []
     for c in constraints:
         cid = c["id"]
-        temp = pd.DataFrame(results.get(cid, []), columns=["PumpingRate", cid])
-        df = pd.merge(df, temp, on="PumpingRate", how="left")
+        vals = results.get(cid, [])
+        s = pd.Series(dict(vals), name=cid, dtype=float) if vals else pd.Series(name=cid, dtype=float)
+        constraint_series.append(s)
+    df = pd.concat([base] + constraint_series, axis=1).reset_index().rename(columns={"index": "PumpingRate"})
 
     # --- find threshold crossings ---
+    def _crossing_tolerance(c, vals, threshold_value):
+        """
+        Absolute tolerance (in the constraint's own units) used to decide whether a
+        point has "reached" the threshold for plateau detection. A per-constraint
+        "tolerance" key takes precedence; otherwise it's scaled to the magnitude of
+        that constraint's own data/threshold so flow (e.g. thousands of m3/day) and
+        head (e.g. fractions of a meter) constraints each get a sensible tolerance
+        automatically, rather than one fixed absolute number across every unit.
+        """
+        if c.get("tolerance") is not None:
+            return float(c["tolerance"])
+        scale = max(float(np.max(np.abs(vals))) if len(vals) else 0.0, abs(threshold_value), 1e-12)
+        return crossing_rel_tol * scale
+
     thresholds, crossings = {}, {}
     constraint_info = {}  # stores detailed info per constraint
 
@@ -917,7 +1130,10 @@ def estimate_sustainable_yield(
                 ref = float(c["reference"])
             thresholds[cid] = ref * float(c["threshold"])
 
-        crossings[cid] = find_threshold_crossing(df["PumpingRate"].values, series.values, thresholds[cid])
+        crossings[cid] = find_threshold_crossing(
+            df["PumpingRate"].values, series.values, thresholds[cid],
+            tol=_crossing_tolerance(c, vals, thresholds[cid]),
+        )
 
         constraint_info[cid] = {
             "type": c["threshold_type"].upper(),
@@ -974,7 +1190,15 @@ def estimate_sustainable_yield(
     ax.set_xlabel("Pumping Rate")
     ax.set_ylabel("Flow Rate")
     ax2.set_ylabel("Head")
-    ax.set_xlim(left=0, right=min(df["PumpingRate"].max() * 1.1, qs_value * 2 if qs_value is not None else df["PumpingRate"].max() * 1.1))
+
+    # guard against degenerate/empty pumping-rate range (avoids a meaningless or zero-width xlim)
+    max_rate = df["PumpingRate"].max() if not df.empty else None
+    if pd.isna(max_rate) or max_rate is None or max_rate <= 0:
+        _warn("PumpingRate has no positive values; using default x-axis limits")
+    else:
+        right_lim = min(max_rate * 1.1, qs_value * 2) if qs_value is not None else max_rate * 1.1
+        if right_lim > 0:
+            ax.set_xlim(left=0, right=right_lim)
     # ax.set_yscale('log')
 
     # combined legend (flows + heads + thresholds)
