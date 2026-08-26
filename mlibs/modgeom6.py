@@ -128,7 +128,7 @@ def compute_top(
         return top
 
     # If transition is True, check transition parameters
-    if transition_cells is None or not isinstance(transition_cells, int) or transition_cells < 1:
+    if transition_cells is None or not isinstance(transition_cells, int) or transition_cells < 0:
         raise ValueError("transition_cells must be a positive integer when transition=True.")
     if transition_type not in ("contain", "extend"):
         raise ValueError("transition_type must be 'contain' or 'extend'.")
@@ -254,7 +254,7 @@ def compute_thickness(
         return thickness_array
 
     # If transition is True, check transition parameters
-    if transition_cells is None or not isinstance(transition_cells, int) or transition_cells < 1:
+    if transition_cells is None or not isinstance(transition_cells, int) or transition_cells < 0:
         raise ValueError("transition_cells must be a positive integer when transition=True.")
     if transition_type not in ("contain", "extend"):
         raise ValueError("transition_type must be 'contain' or 'extend'.")

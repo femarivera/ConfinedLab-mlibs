@@ -60,12 +60,29 @@ def moments_from_percentiles(k1, p1, k2, p2):
     Very often a given hydraulic property of an aquifer is known as a broad range.
     One could assume that this range represents the 90% confidence interval (5th and 95th percentiles)
     of a log-normal distribution, and use this function to estimate the distribution parameters.
+
+    Raises:
+        ValueError: if p1 or p2 are not strictly within (0,1), if p1 == p2,
+                    or if k1/k2 are not both positive.
     """
+    if not (0.0 < p1 < 1.0) or not (0.0 < p2 < 1.0):
+        raise ValueError(f"Percentiles must be strictly within (0,1), got p1={p1}, p2={p2}")
+    if p1 == p2:
+        raise ValueError("Percentiles must be distinct")
+    if k1 <= 0 or k2 <= 0:
+        raise ValueError(f"k1 and k2 must be positive (lognormal support), got k1={k1}, k2={k2}")
+
     z1 = norm.ppf(p1)
     z2 = norm.ppf(p2)
-    if z2 == z1:
-        raise ValueError("Percentiles must be distinct")
-    sigma = (np.log(k2) - np.log(k1)) / (z2 - z1) #Can be used as an approximation of the sill for a variogram of Z=ln(K)
+
+    # Guard against inconsistent ordering (e.g. p1 > p2 but k1 < k2, or vice versa),
+    if (k2 - k1) * (z2 - z1) < 0:
+        raise ValueError(
+            "Inconsistent inputs: (k1, p1) and (k2, p2) must be ordered consistently "
+            "(k2 > k1 iff p2 > p1)."
+        )
+
+    sigma = (np.log(k2) - np.log(k1)) / (z2 - z1)  # Can be used as an approximation of the sill for a variogram of Z=ln(K)
     mu = np.log(k1) - z1 * sigma
     geom_mean = np.exp(mu)
     sigma2 = sigma**2
@@ -99,15 +116,20 @@ def generate_random_field(shape, variogram_type="exponential",
     using a spectral (FFT-based) simulation method.
 
     This function creates a spatially correlated random field by filtering Gaussian white noise in the frequency domain
-    according to a specified variogram model spectrum (exponential, gaussian, or spherical). The resulting field is then
+    according to a specified variogram model spectrum (exponential, gaussian, or spherical_approx). The resulting field is then
     transformed to a log-normal distribution, commonly used for simulating heterogeneous properties such as hydraulic conductivity.
 
     Args:
         shape (tuple): Shape of the output field grid (nx, ny).
-        variogram_type (str): Type of variogram/covariance model ("exponential", "gaussian", or "spherical").
+        variogram_type (str): Type of variogram/covariance model ("exponential", "gaussian", or "spherical_approx").
+            NOTE: "spherical_approx" is NOT the true spherical variogram's spectral density (the spherical
+            covariance's Fourier transform has no simple closed form in 2D). It's a smooth stand-in with a
+            faster-decaying spectrum than the exponential model, giving qualitatively similar range/sill
+            behavior. If you need an exact spherical variogram, simulate the spectrum numerically from the
+            truncated spherical covariance (via FFT) or use turning-bands / sequential Gaussian simulation instead.
         geom_mean (float): Geometric mean of the log-normal field. Normally the most meaningful statistic for log-normal variables in hydrogeology.
-        sill (float): Sill of the variogram (variance parameter of the log-normal distribution). Should represent total variability.
-        nugget (float): Nugget effect (variance at zero distance). Represents unstructured variability.
+        sill (float): Sill of the variogram (total variance parameter of the log-normal distribution, including nugget). Should represent total variability.
+        nugget (float): Nugget effect (variance at zero distance). Represents unstructured variability. Must be <= sill.
         range_param (float): Correlation length (practical range) in model units.
         drow (float): Grid spacing in the row direction (model units).
         dcol (float): Grid spacing in the column direction (model units).
@@ -118,7 +140,13 @@ def generate_random_field(shape, variogram_type="exponential",
 
     Returns:
         np.ndarray: 2D array of shape (nx, ny) representing the log-normal random field with spatial correlation.
+
+    Raises:
+        ValueError: If variogram_type is unsupported, or if nugget > sill.
     """
+
+    if nugget > sill:
+        raise ValueError(f"nugget ({nugget}) cannot exceed sill ({sill})")
 
     rng = np.random.default_rng(seed)
     nx, ny = shape
@@ -133,18 +161,20 @@ def generate_random_field(shape, variogram_type="exponential",
         spectrum = 1.0 / (1.0 + (2*np.pi*k*range_param)**2)**1.5
     elif variogram_type == "gaussian":
         spectrum = np.exp(-(np.pi*k*range_param)**2)
-    elif variogram_type == "spherical":
+    elif variogram_type == "spherical_approx":
+        # Approximation only: faster-decaying spectrum than the exponential model,
+        # chosen for qualitatively similar range/sill behavior. This is NOT derived
+        # from the true spherical covariance's Fourier transform (see docstring).
         spectrum = 1.0 / (1.0 + (2*np.pi*k*range_param)**2)**2
     else:
         raise ValueError("Unsupported variogram type")
-    spectrum[0, 0] = 1.0  # DC component
 
     # Generate white noise in space, FFT, filter
-    w = rng.normal(size=(nx,ny))
+    w = rng.normal(size=(nx, ny))
     W = fftn(w)
 
     # Inverse FFT to get correlated field, back to real space
-    Z = np.real(ifftn(W * np.sqrt(spectrum))) 
+    Z = np.real(ifftn(W * np.sqrt(spectrum)))
 
     # Standardize: Gaussian field, mean 0, std 1
     Z = (Z - np.mean(Z)) / np.std(Z)
@@ -164,14 +194,15 @@ def generate_random_field(shape, variogram_type="exponential",
     # Structured variability
     sigma = np.sqrt(sill - nugget)
     Z = (sigma * Z)
-    # Unstructured variability (nugget)
-    Z = Z + (np.sqrt(nugget) * np.random.normal(size=(nx, ny)))
+    # Unstructured variability (nugget) — use the seeded rng for reproducibility
+    Z = Z + (np.sqrt(nugget) * rng.normal(size=(nx, ny)))
 
     # Shift to the desired mean
-    Z = Z + mu #Now Z is a gaussian field with mean mu and variance sill + nugget
-     
+    Z = Z + mu  # Now Z is a gaussian field with mean mu and total variance sill
+                # (structured variance sill-nugget + nugget variance nugget = sill)
+
     # Log-normal transformation
-    field = np.exp(Z) # Now field follows a log-normal distribution with parameters mu and sigma2=Sill+nugget
+    field = np.exp(Z)  # Now field follows a log-normal distribution with parameters mu and sigma2=sill
 
     # Apply parameter-specific constraints
     if param_type.lower() == "sy":

@@ -26,10 +26,11 @@ import flopy
 import matplotlib.pyplot as plt
 from matplotlib.cm import get_cmap
 from matplotlib.colors import LogNorm
-from matplotlib.ticker import FuncFormatter, FixedLocator
+from matplotlib.ticker import FuncFormatter, MultipleLocator
 from matplotlib.lines import Line2D
 from sklearn.linear_model import LinearRegression
 from scipy.optimize import curve_fit
+from scipy.stats import gaussian_kde
 from sklearn.metrics import r2_score
 from sklearn.metrics import r2_score
 from scipy.interpolate import griddata
@@ -4228,11 +4229,85 @@ def load_cell_volumes(dis_path):
 
     return volumes
 
-def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B, L, subfolder_keyword="parv_"):
+def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict,
+                     subfolder_keyword="parv_", volume_weighted=True,
+                     B=None, L=None, B_threshold=None):
     """
-    Collect results and append volume-weighted statistics per zone and total.
+    Collect results and append statistics per zone and total.
+
+    main_folder : str
+        Path to the main folder containing subfolders with simulation results.
+    thickness_dict : dict
+        Dictionary mapping zone numbers to their thickness values.
+    length_dict : dict
+        Dictionary mapping zone numbers to their length values.
+    unc_length_dict : dict
+        Dictionary mapping zone numbers to their uncertainty in length values.
+    subfolder_keyword : str
+        Keyword to identify subfolders containing simulation results.
+    volume_weighted : bool
+        If True (default), tr_ statistics (mean/percentiles) are computed as cell volume-weighted.
+        If False, plain (unweighted) mean/percentiles are computed instead.
+    B : float, optional
+        Global system thickness. If provided, used instead of the
+        per-sequence B_seq in the analytical timescale formulas below.
+    L : float, optional
+        Global system length. If provided, used instead of the
+        per-sequence L_seq in the analytical timescale formulas below.
+    B_threshold : float, optional
+        Global threshold thickness. If provided, used instead of the
+        per-sequence threshold_thickness in the analytical timescale
+        formulas below.
+
+    Notes on B_seq / L_seq
+    -----------------------
+    For each zone z, B_seq and L_seq are derived per sequence (zones
+    zz <= z) directly from the input dictionaries:
+
+    - ``B_seq`` = sum of ``thickness_dict`` values over zones zz <= z.
+    - ``L_seq`` = max of ``length_dict`` values over zones zz <= z.
+
+    So zone 3's B_seq/L_seq are based on zones 1, 2, 3; zone 5's on zones
+    1-5; zone 1's on zone 1 only. These are used in place of B and L in
+    the analytical timescale formulas below, unless B or L is provided
+    directly, in which case that provided value overrides its per-sequence
+    counterpart (independently of the other).
+
+    Notes on equivalent properties
+    -------------------------------
+    - ``Dv_eq``, ``Dh_eq``, ``kv_eq``, ``kh_eq``: for a given zone z these
+      are computed using only the zones "overlying" it, i.e. all zones
+      zz <= z (zone 1 up to zone z). So zone 3 uses zones 1, 2, 3; zone 5
+      uses zones 1, 2, 3, 4, 5; zone 1 uses only zone 1.
+    - All the analytical timescales that depend on these equivalents
+      (tao_v_eq, tao_h_eq, tr_v_eq, tr_h_eq, tr_mixed_eq, tr_aquifer,
+      tr_basin) are computed row-wise, i.e. each zone uses its own
+      overlying-stack equivalent rather than a single system-wide value.
+
+    Notes on response-time statistics
+    ----------------------------------
+    Three types of tr_* statistics (mean/percentiles/max) are computed
+    from the raw response-time array:
+
+    - ``*_zone`` (e.g. ``tr_95p_vol_zone``): computed from cells belonging
+      only to that single zone (zones_array == z).
+    - ``*_seq`` (e.g. ``tr_95p_vol_seq``): computed from cells belonging to
+      that zone AND all overlying zones, i.e. zz <= z (same cumulative
+      logic as the Dv_eq/Dh_eq/kv_eq/kh_eq equivalents above). So zone 3
+      pools cells from zones 1, 2, 3; zone 5 pools cells from zones 1-5;
+      zone 1 uses only zone 1.
+    - unsuffixed (e.g. ``tr_95p_vol``): computed from the entire domain,
+      all zones combined, one value repeated for every row.
     """
     zone_records = []
+
+    # --- select mean/percentile implementation based on the flag ---
+    if volume_weighted:
+        mean_func = volume_weighted_mean
+        pct_func = volume_weighted_percentile
+    else:
+        mean_func = lambda vals, vols: np.nanmean(vals)
+        pct_func = lambda vals, vols, p: np.nanpercentile(vals, p)
 
     for folder in os.listdir(main_folder):
         folder_path = os.path.join(main_folder, folder)
@@ -4242,6 +4317,7 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
             continue
 
         setup_path = os.path.join(folder_path, "setup.xlsx")
+        print("Reading setup file:", setup_path)
         output_path = os.path.join(folder_path, "mf", "output", "tr_zones_relative_local.csv")
 
         if not os.path.exists(setup_path):
@@ -4255,12 +4331,12 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
         df_setup = pd.read_excel(setup_path, sheet_name="parameters")
         param_dict = df_setup.set_index("par_name")["value"].to_dict()
 
-        zones = sorted({name.split("_")[-1] for name in param_dict.keys() if "_" in name})
-        zones_h = [int(z) for z in zones if int(z) % 2 == 1] #Aquifers
-        zones_v = [int(z) for z in zones if int(z) % 2 == 0] #Aquitards
-        
-        kv = {int(z): param_dict.get(f"kv_{z}")/86400 for z in zones} # Converted to m/s
-        kh = {int(z): param_dict.get(f"kh_{z}")/86400 for z in zones} # Converted to m/s
+        zones = sorted({name.split("_")[-1] for name in param_dict.keys() if "_" in name and name.split("_")[-1].isdigit()})
+        zones_h = [int(z) for z in zones if int(z) % 2 == 1]  # Aquifers
+        zones_v = [int(z) for z in zones if int(z) % 2 == 0]  # Aquitards
+
+        kv = {int(z): param_dict.get(f"kv_{z}") / 86400 for z in zones}  # Converted to m/s
+        kh = {int(z): param_dict.get(f"kh_{z}") / 86400 for z in zones}  # Converted to m/s
         ss = {int(z): param_dict.get(f"ss_{z}") for z in zones}
         sy = {int(z): param_dict.get(f"sy_{z}") for z in zones}
 
@@ -4272,15 +4348,30 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
         # --- INITIALIZE OUTPUT DATAFRAME ---
         df_zone_out = pd.DataFrame({"zone": sorted(map(int, zones))})
 
-        # --- COMPUTE Dv, Dh, Dv_eq, Dh_eq ---  
-        Dv = {int(z): (kv[int(z)] / ss[int(z)]) for z in zones} 
-        Dh = {int(z): (kh[int(z)] / ss[int(z)] if int(z)!=1 else kh[int(z)] * thickness[int(z)] / sy[int(z)]) for z in zones}
+        # --- COMPUTE Dv, Dh ---
+        Dv = {int(z): (kv[int(z)] / ss[int(z)]) for z in zones}
+        Dh = {int(z): (kh[int(z)] / ss[int(z)] if int(z) != 1 else kh[int(z)] * thickness[int(z)] / sy[int(z)]) for z in zones}
 
-        Dv_eq = B / sum(thickness[int(z)] / Dv[int(z)] for z in zones)
-        Dh_eq = sum(Dh[int(z)] * thickness[int(z)] for z in zones) / sum(thickness[int(z)] for z in zones)
+        zones_sorted = sorted(int(z) for z in zones)
 
-        kv_eq = B / sum(thickness[int(z)] / kv[int(z)] for z in zones)
-        kh_eq = sum(kh[int(z)] * thickness[int(z)] for z in zones) / sum(thickness[int(z)] for z in zones)
+        # ----------------------------------------------------------------------- #
+        # -------- PER-SEQUENCE (OVERLYING-ZONES) EQUIVALENTS ------------------- #
+
+        Dv_eq_seq, Dh_eq_seq, kv_eq_seq, kh_eq_seq = {}, {}, {}, {}
+        B_seq, L_seq = {}, {}
+        for z in zones_sorted:
+            subset = [zz for zz in zones_sorted if zz <= z]
+            thickness_subset_sum = sum(thickness[zz] for zz in subset)
+            length_subset_max = max(length[zz] for zz in subset)
+
+            Dv_eq_seq[z] = thickness_subset_sum / sum(thickness[zz] / Dv[zz] for zz in subset)
+            Dh_eq_seq[z] = sum(Dh[zz] * thickness[zz] for zz in subset) / thickness_subset_sum
+
+            kv_eq_seq[z] = thickness_subset_sum / sum(thickness[zz] / kv[zz] for zz in subset)
+            kh_eq_seq[z] = sum(kh[zz] * thickness[zz] for zz in subset) / thickness_subset_sum
+
+            B_seq[z] = thickness_subset_sum
+            L_seq[z] = length_subset_max
 
         # Merge computed parameters
         df_zone_out["kv"] = df_zone_out["zone"].map(kv)
@@ -4293,16 +4384,19 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
         df_zone_out["length"] = df_zone_out["zone"].map(length)
         df_zone_out["unc_length"] = df_zone_out["zone"].map(unc_length)
         df_zone_out["conf_length"] = df_zone_out["length"] - df_zone_out["unc_length"]
-        df_zone_out["Dv_eq"] = Dv_eq
-        df_zone_out["Dh_eq"] = Dh_eq
-        df_zone_out["kv_eq"] = kv_eq
-        df_zone_out["kh_eq"] = kh_eq
+
+        df_zone_out["Dv_eq"] = df_zone_out["zone"].map(Dv_eq_seq)
+        df_zone_out["Dh_eq"] = df_zone_out["zone"].map(Dh_eq_seq)
+        df_zone_out["kv_eq"] = df_zone_out["zone"].map(kv_eq_seq)
+        df_zone_out["kh_eq"] = df_zone_out["zone"].map(kh_eq_seq)
+        df_zone_out["B_seq"] = df_zone_out["zone"].map(B_seq)
+        df_zone_out["L_seq"] = df_zone_out["zone"].map(L_seq)
+
         df_zone_out["anisotropy"] = df_zone_out["kh"] / df_zone_out["kv"]
-        df_zone_out["ratio"] = df_zone_out["Dv_eq"] / df_zone_out["Dh_eq"]
 
         # ----------------------------------------------------------------------- #
         # -------------------- COMPUTE RESPONSE TIME STATISTICS ----------------- #
-        # ----------------------------------------------------------------------- # 
+        # ----------------------------------------------------------------------- #
         dis_path = os.path.join(folder_path, "mf", "DEESAC.dis")
         zone_path = os.path.join(folder_path, "mf", "zone_array.npy")
         tr_array_path = os.path.join(folder_path, "mf", "output", "response_time_relative_local.npy")
@@ -4315,22 +4409,28 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
             zones_array = np.load(zone_path).flatten()
 
             # Unconfined (top most active cells) response times
-            valid_mask = ~np.isnan(tr_array_3d)
-            valid_count = np.sum(valid_mask, axis=0)
-            irch = tr_array_3d.shape[0] - valid_count
             nlay, nrow, ncol = tr_array_3d.shape
+            valid_mask = ~np.isnan(tr_array_3d)
+            top_active = np.argmax(valid_mask, axis=0)
+            has_active = np.any(valid_mask, axis=0)
             i_idx, j_idx = np.indices((nrow, ncol))
-            mask = j_idx < (ncol - 2)
-            k_idx = irch[mask]
+            mask = (j_idx < ncol - 2) & has_active
+            k_idx = top_active[mask]
             i_idx = i_idx[mask]
             j_idx = j_idx[mask]
             tr_unc = tr_array_3d[k_idx, i_idx, j_idx]
             vol_unc = volumes_3d[k_idx, i_idx, j_idx]
-            df_zone_out["tr_unc_mean_vol"] = volume_weighted_mean(tr_unc, vol_unc)
-            df_zone_out["tr_unc_5p_vol"] = volume_weighted_percentile(tr_unc, vol_unc, 5)
-            df_zone_out["tr_unc_median_vol"] = volume_weighted_percentile(tr_unc, vol_unc, 50)
-            df_zone_out["tr_unc_95p_vol"] = volume_weighted_percentile(tr_unc, vol_unc, 95)
+            df_zone_out["tr_unc_mean_vol"] = mean_func(tr_unc, vol_unc)
+            df_zone_out["tr_unc_5p_vol"] = pct_func(tr_unc, vol_unc, 5)
+            df_zone_out["tr_unc_median_vol"] = pct_func(tr_unc, vol_unc, 50)
+            df_zone_out["tr_unc_95p_vol"] = pct_func(tr_unc, vol_unc, 95)
             df_zone_out["tr_unc_max"] = np.nanmax(tr_unc)
+            tr_unc_valid = tr_unc[~np.isnan(tr_unc)]
+            kde = gaussian_kde(tr_unc_valid)
+            x = np.linspace(tr_unc_valid.min(), tr_unc_valid.max(), 2000)
+            pdf = kde(x)
+            tr_unc_mode = x[np.argmax(pdf)]
+            df_zone_out["tr_unc_mode"] = tr_unc_mode
 
             # --- per-zone stats ---
             tr_mean_vol = []
@@ -4354,11 +4454,11 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
                 tr_zone_vals = tr_array[mask]
                 vol_zone = volumes[mask]
 
-                tr_mean_vol.append(volume_weighted_mean(tr_zone_vals, vol_zone))
-                tr_5p_vol.append(volume_weighted_percentile(tr_zone_vals, vol_zone, 5))
-                tr_median_vol.append(volume_weighted_percentile(tr_zone_vals, vol_zone, 50))
-                tr_90p_vol.append(volume_weighted_percentile(tr_zone_vals, vol_zone, 90))
-                tr_95p_vol.append(volume_weighted_percentile(tr_zone_vals, vol_zone, 95))
+                tr_mean_vol.append(mean_func(tr_zone_vals, vol_zone))
+                tr_5p_vol.append(pct_func(tr_zone_vals, vol_zone, 5))
+                tr_median_vol.append(pct_func(tr_zone_vals, vol_zone, 50))
+                tr_90p_vol.append(pct_func(tr_zone_vals, vol_zone, 90))
+                tr_95p_vol.append(pct_func(tr_zone_vals, vol_zone, 95))
                 tr_max.append(np.nanmax(tr_zone_vals))
 
             df_zone_out["tr_mean_vol_zone"] = tr_mean_vol
@@ -4368,12 +4468,49 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
             df_zone_out["tr_95p_vol_zone"] = tr_95p_vol
             df_zone_out["tr_max_zone"] = tr_max
 
+            # --- sequence stats (cumulative over overlying zones, zz <= z) ---
+            tr_mean_vol_seq = []
+            tr_5p_vol_seq = []
+            tr_median_vol_seq = []
+            tr_90p_vol_seq = []
+            tr_95p_vol_seq = []
+            tr_max_seq = []
+
+            for z in df_zone_out["zone"]:
+                seq_zones = [zz for zz in zones_sorted if zz <= z]
+                mask = np.isin(zones_array, seq_zones)
+                if not np.any(mask):
+                    tr_mean_vol_seq.append(np.nan)
+                    tr_5p_vol_seq.append(np.nan)
+                    tr_median_vol_seq.append(np.nan)
+                    tr_90p_vol_seq.append(np.nan)
+                    tr_95p_vol_seq.append(np.nan)
+                    tr_max_seq.append(np.nan)
+                    continue
+
+                tr_seq_vals = tr_array[mask]
+                vol_seq = volumes[mask]
+
+                tr_mean_vol_seq.append(mean_func(tr_seq_vals, vol_seq))
+                tr_5p_vol_seq.append(pct_func(tr_seq_vals, vol_seq, 5))
+                tr_median_vol_seq.append(pct_func(tr_seq_vals, vol_seq, 50))
+                tr_90p_vol_seq.append(pct_func(tr_seq_vals, vol_seq, 90))
+                tr_95p_vol_seq.append(pct_func(tr_seq_vals, vol_seq, 95))
+                tr_max_seq.append(np.nanmax(tr_seq_vals))
+
+            df_zone_out["tr_mean_vol_seq"] = tr_mean_vol_seq
+            df_zone_out["tr_5p_vol_seq"] = tr_5p_vol_seq
+            df_zone_out["tr_median_vol_seq"] = tr_median_vol_seq
+            df_zone_out["tr_90p_vol_seq"] = tr_90p_vol_seq
+            df_zone_out["tr_95p_vol_seq"] = tr_95p_vol_seq
+            df_zone_out["tr_max_seq"] = tr_max_seq
+
             # --- total/system stats ---
-            df_zone_out["tr_mean_vol"] = volume_weighted_mean(tr_array, volumes)
-            df_zone_out["tr_5p_vol"] = volume_weighted_percentile(tr_array, volumes, 5)
-            df_zone_out["tr_median_vol"] = volume_weighted_percentile(tr_array, volumes, 50)
-            df_zone_out["tr_90p_vol"] = volume_weighted_percentile(tr_array, volumes, 90)
-            df_zone_out["tr_95p_vol"] = volume_weighted_percentile(tr_array, volumes, 95)
+            df_zone_out["tr_mean_vol"] = mean_func(tr_array, volumes)
+            df_zone_out["tr_5p_vol"] = pct_func(tr_array, volumes, 5)
+            df_zone_out["tr_median_vol"] = pct_func(tr_array, volumes, 50)
+            df_zone_out["tr_90p_vol"] = pct_func(tr_array, volumes, 90)
+            df_zone_out["tr_95p_vol"] = pct_func(tr_array, volumes, 95)
             df_zone_out["tr_max"] = np.nanmax(tr_array)
 
             # --- grouped stats: aquifers vs aquitards ---
@@ -4385,11 +4522,11 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
                 tr_aqf = tr_array[mask_aqf]
                 vol_aqf = volumes[mask_aqf]
 
-                df_zone_out["tr_mean_vol_aqf"] = volume_weighted_mean(tr_aqf, vol_aqf)
-                df_zone_out["tr_5p_vol_aqf"] = volume_weighted_percentile(tr_aqf, vol_aqf, 5)
-                df_zone_out["tr_median_vol_aqf"] = volume_weighted_percentile(tr_aqf, vol_aqf, 50)
-                df_zone_out["tr_90p_vol_aqf"] = volume_weighted_percentile(tr_aqf, vol_aqf, 90)
-                df_zone_out["tr_95p_vol_aqf"] = volume_weighted_percentile(tr_aqf, vol_aqf, 95)
+                df_zone_out["tr_mean_vol_aqf"] = mean_func(tr_aqf, vol_aqf)
+                df_zone_out["tr_5p_vol_aqf"] = pct_func(tr_aqf, vol_aqf, 5)
+                df_zone_out["tr_median_vol_aqf"] = pct_func(tr_aqf, vol_aqf, 50)
+                df_zone_out["tr_90p_vol_aqf"] = pct_func(tr_aqf, vol_aqf, 90)
+                df_zone_out["tr_95p_vol_aqf"] = pct_func(tr_aqf, vol_aqf, 95)
                 df_zone_out["tr_max_aqf"] = np.nanmax(tr_aqf)
 
             # Aquitards (v)
@@ -4397,11 +4534,11 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
                 tr_aqt = tr_array[mask_aqt]
                 vol_aqt = volumes[mask_aqt]
 
-                df_zone_out["tr_mean_vol_aqt"] = volume_weighted_mean(tr_aqt, vol_aqt)
-                df_zone_out["tr_5p_vol_aqt"] = volume_weighted_percentile(tr_aqt, vol_aqt, 5)
-                df_zone_out["tr_median_vol_aqt"] = volume_weighted_percentile(tr_aqt, vol_aqt, 50)
-                df_zone_out["tr_90p_vol_aqt"] = volume_weighted_percentile(tr_aqt, vol_aqt, 90)
-                df_zone_out["tr_95p_vol_aqt"] = volume_weighted_percentile(tr_aqt, vol_aqt, 95)
+                df_zone_out["tr_mean_vol_aqt"] = mean_func(tr_aqt, vol_aqt)
+                df_zone_out["tr_5p_vol_aqt"] = pct_func(tr_aqt, vol_aqt, 5)
+                df_zone_out["tr_median_vol_aqt"] = pct_func(tr_aqt, vol_aqt, 50)
+                df_zone_out["tr_90p_vol_aqt"] = pct_func(tr_aqt, vol_aqt, 90)
+                df_zone_out["tr_95p_vol_aqt"] = pct_func(tr_aqt, vol_aqt, 95)
                 df_zone_out["tr_max_aqt"] = np.nanmax(tr_aqt)
 
         else:
@@ -4412,6 +4549,12 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
             df_zone_out["tr_90p_vol_zone"] = np.nan
             df_zone_out["tr_95p_vol_zone"] = np.nan
             df_zone_out["tr_max_zone"] = np.nan
+            df_zone_out["tr_mean_vol_seq"] = np.nan
+            df_zone_out["tr_5p_vol_seq"] = np.nan
+            df_zone_out["tr_median_vol_seq"] = np.nan
+            df_zone_out["tr_90p_vol_seq"] = np.nan
+            df_zone_out["tr_95p_vol_seq"] = np.nan
+            df_zone_out["tr_max_seq"] = np.nan
             df_zone_out["tr_mean_vol"] = np.nan
             df_zone_out["tr_5p_vol"] = np.nan
             df_zone_out["tr_median_vol"] = np.nan
@@ -4437,71 +4580,90 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict, B
         # -------------------- COMPUTE ANALYTICAL TIMESCALES -------------------- #
         # ----------------------------------------------------------------------- #
 
-        conversion = 1 / (86400*360)
+        conversion = 1 / (86400 * 360)
 
-        # --- Equivalent homogeneous timescales ---
-        tao_v_eq = (B**2 / Dv_eq) * conversion
-        tao_h_eq = (L**2 / Dh_eq) * conversion
-        tr_v_eq = (12/np.pi**2) * tao_v_eq
-        tr_h_eq = (3/np.pi**2) * tao_h_eq
+        # --- Threshold thickness per sequence: thickness of the layer with the ---
+        # --- highest vertical diffusive resistance (b_i / Dv_i) among zz <= z ---
+        threshold_thickness_seq = {}
+        Dv_threshold_seq = {}
+        for z in zones_sorted:
+            subset = [zz for zz in zones_sorted if zz <= z]
+            resistances = {zz: thickness[zz] / Dv[zz] for zz in subset}
+            zz_max_resistance = max(resistances, key=resistances.get)
+            threshold_thickness_seq[z] = thickness[zz_max_resistance]
+            Dv_threshold_seq[z] = Dv[zz_max_resistance]
+        threshold_thickness = df_zone_out["zone"].map(threshold_thickness_seq)
+        Dv_threshold = df_zone_out["zone"].map(Dv_threshold_seq)
+        df_zone_out["threshold_thickness"] = threshold_thickness
+        df_zone_out["Dv_threshold"] = Dv_threshold
+
+        # --- Geometry used in the analytical formulas: each of B, L, B_threshold ---
+        # --- overrides its per-sequence counterpart independently if provided ---
+        B_geom = B if B is not None else df_zone_out["B_seq"]
+        L_geom = L if L is not None else df_zone_out["L_seq"]
+        B_threshold_geom = B_threshold if B_threshold is not None else threshold_thickness
+
+        # --- Equivalent homogeneous timescales (per sequence, using that zone's own overlying-stack Dv_eq/Dh_eq) ---
+        tao_v_eq = (B_geom**2 / df_zone_out["Dv_eq"]) * conversion
+        tao_h_eq = (L_geom**2 / df_zone_out["Dh_eq"]) * conversion
+        tr_v_eq = (12 / np.pi**2) * tao_v_eq
+        tr_h_eq = (3 / np.pi**2) * tao_h_eq
 
         # --- Timescales per zone ---
-        mean_thickness_v = df_zone_out.loc[
-            df_zone_out["zone"].isin(zones_v),
-            "thickness"].mean()
-
-        tao_h_zone = conversion * df_zone_out["length"]**2 / df_zone_out["Dh"].values
         tao_v_zone = conversion * df_zone_out["thickness"]**2 / df_zone_out["Dv"].values
-        tr_h_zone = (3/np.pi**2) * tao_h_zone
-        tr_v_zone = (3/np.pi**2) * tao_v_zone
+        tao_h_zone = conversion * df_zone_out["length"]**2 / df_zone_out["Dh"].values
+        tr_v_zone = (3 / np.pi**2) * tao_v_zone
+        tr_h_zone = (3 / np.pi**2) * tao_h_zone
         tr_zone = np.where(df_zone_out["zone"].isin(zones_h), tr_h_zone, tr_v_zone)
 
-        # --- Timescales for the mixed aquifer formulation ---#      
+        # Cumulative max of tr_v_zone over the sequence (zz <= z)
+        tr_v_zone_seq_max = pd.Series(tr_v_zone).cummax().values
+
+        # --- Timescales for the mixed aquifer formulation (uses each zone's own kh_eq) --- #
         tr_mixed_zone = 3 * conversion * df_zone_out["unc_length"] * df_zone_out["sy"] \
-            * (df_zone_out["conf_length"] + df_zone_out["unc_length"]/2) / (df_zone_out["thickness"] * df_zone_out["kh"])
+            * (df_zone_out["conf_length"] + df_zone_out["unc_length"] / 2) / (df_zone_out["thickness"] * df_zone_out["kh"])
 
-        tr_mixed_eq = 3 *conversion * df_zone_out["unc_length"] * df_zone_out["sy"] \
-             * (df_zone_out["conf_length"] + df_zone_out["unc_length"]/2) / (df_zone_out["thickness"] * df_zone_out["kh_eq"])
-        
-        # --- Revised analytical response time for the deepest confined aquifer ---#
-        tr_aquifer = 1 / ((1/tr_h_eq)+(1/tr_v_eq))
-        # tr_aquifer = max(tr_aquifer, df_zone_out["tr_unc_mean_vol"].iloc[0])
+        tr_mixed_eq = 3 * conversion * df_zone_out["unc_length"] * df_zone_out["sy"] \
+            * (df_zone_out["conf_length"] + df_zone_out["unc_length"] / 2) / (df_zone_out["thickness"] * df_zone_out["kh_eq"])
 
-        # --- Revised analytical basin-scale response time ---#
-        tr_basin = np.where(Dv_eq / Dh_eq > 4*(mean_thickness_v)**2 / L**2,
-                            1 / ((1/tr_h_eq)+(1/tr_v_eq)),
-                            tr_v_zone.max())
-        # tr_basin = max(tr_basin, df_zone_out["tr_unc_mean_vol"].iloc[0])
+        # --- Revised analytical response time for the deepest confined aquifer (per zone) ---#
+        # Penultimate zone in the entire system
+        penultimate_zone = zones_sorted[-2]
+        tr_v_zone_penultimate = tr_v_zone[zones_sorted.index(penultimate_zone)]
+        tr_v_zone_penultimate_all = np.full(
+            len(df_zone_out),
+            tr_v_zone_penultimate)
 
-        tr_basin_arid = np.where(
-            Dv_eq / Dh_eq > 4*(mean_thickness_v)**2 / L**2,
-            tr_h_eq,
-            tr_v_zone.max()
-            ) #Arid areas
-        # tr_basin_arid = max(tr_basin_arid, df_zone_out["tr_unc_mean_vol"].iloc[0]) 
+        # Revised analytical response time for the deepest confined aquifer
+        tr_aquifer = np.where(
+            tr_h_eq >= tr_v_zone_penultimate_all,
+            1 / ((1 / tr_h_eq) + (1 / tr_v_eq)),
+            tr_h_zone)
+
+        tr_basin = np.where( tr_h_eq >= tr_v_zone_seq_max, 
+                             1 / ((1 / tr_h_eq) + (1 / tr_v_eq)),
+                             tr_v_zone_seq_max)
 
         # --- Append analytical timescales to dataframe ---
-        df_zone_out["tao_v_eq"] = tao_v_eq
-        df_zone_out["tao_h_eq"] = tao_h_eq
+        df_zone_out["r"] = tr_h_eq/tr_v_zone_seq_max
         df_zone_out["tr_v_eq"] = tr_v_eq
         df_zone_out["tr_h_eq"] = tr_h_eq
 
-        df_zone_out["tao_h_zone"] = tao_h_zone
-        df_zone_out["tao_v_zone"] = tao_v_zone
         df_zone_out["tr_h_zone"] = tr_h_zone
         df_zone_out["tr_v_zone"] = tr_v_zone
         df_zone_out["tr_zone"] = tr_zone
+
+        df_zone_out["tr_v_zone_seq_max"] = tr_v_zone_seq_max
 
         df_zone_out["tr_mixed_zone"] = tr_mixed_zone
         df_zone_out["tr_mixed_eq"] = tr_mixed_eq
 
         df_zone_out["tr_aquifer"] = tr_aquifer
         df_zone_out["tr_basin"] = tr_basin
-        df_zone_out["tr_basin_arid"] = tr_basin_arid
 
         df_zone_out["folder"] = folder
 
-        df_zone_out["sim"] = np.log10(df_zone_out["tr_95p_vol"])
+        df_zone_out["sim"] = np.log10(df_zone_out["tr_95p_vol_seq"])
         df_zone_out["an"] = np.log10(df_zone_out["tr_basin"])
         df_zone_out["diff"] = df_zone_out["sim"] - df_zone_out["an"]
 
@@ -4513,16 +4675,17 @@ def loglog_scatter_df(
     df,
     x_column,
     y_column,
-    color_column=None,
     zone_column="zone",
-    zone_value=None,         # zone to filter points
-    color_zone_value=None,   # zone to get color values
+    zone_value=None,
+    color_column=None,         
+    color_zone_value=None, 
     color_bar_label=None,
     xlabel=None,
     ylabel=None,
     title=None,
     cmap="viridis_r",
     marker_size=50,
+    plot_metrics = True,
     min_val = None,
     max_val= None,
     SAVE = False,
@@ -4545,6 +4708,7 @@ def loglog_scatter_df(
         title: Plot title.
         cmap: Colormap for points.
         marker_size: Scatter marker size.
+        plot_metrics: Whether to compute and display metrics (R², MAE, RMSE, KGE).
         min_val: Minimum value for axis limits.
         max_val: Maximum value for axis limits.
         SAVE: Whether to save the plot.
@@ -4572,21 +4736,21 @@ def loglog_scatter_df(
         logy_pred = slope * logx + intercept
 
         # Residuals
-        residuals = logy - logy_pred
+        residuals = logy_pred - logy
 
         # --- Metrics ---
         ss_res = np.sum(residuals ** 2)
         ss_tot = np.sum((logy - np.mean(logy)) ** 2)
         r2 = 1 - ss_res / ss_tot
 
-        mae = np.mean(np.abs(residuals))
-        rmse = np.sqrt(np.mean(residuals ** 2))
-        # bias = np.mean(residuals)
+        mae = np.mean(np.abs(logx-logy))
+        rmse = np.sqrt(np.mean((logx-logy) ** 2))
+        bias = np.mean(logx-logy)
 
         # --- KGE (log space) ---
-        r = np.corrcoef(logy, logy_pred)[0, 1]
-        alpha = np.std(logy_pred) / np.std(logy)
-        beta = np.mean(logy_pred) / np.mean(logy)
+        r = np.corrcoef(logy, logx)[0, 1]
+        alpha = np.std(logx) / np.std(logy)
+        beta = np.mean(logx) / np.mean(logy)
         kge = 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
 
     else:
@@ -4656,22 +4820,23 @@ def loglog_scatter_df(
     ax.set_aspect('equal', adjustable='box')
 
     # --- Metrics box ---
-    if not np.isnan(r2):
-        ax.text(
-            0.05, 0.95,
-            (
-                f"$R^2$ = {r2:.3f}\n"
-                f"MAE = {mae:.3f}\n"
-                f"RMSE = {rmse:.3f}\n"
-                # f"BIAS = {bias:.3f}\n"
-                f"KGE = {kge:.3f}"
-            ),
-            transform=ax.transAxes,
-            fontsize=9,
-            verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='white',
-                    alpha=0.85, edgecolor='black')
-        )
+    if plot_metrics: 
+        if not np.isnan(r2):
+            ax.text(
+                0.05, 0.95,
+                (
+                    f"$R^2$ = {r2:.3f}\n"
+                    f"MAE = {mae:.3f}\n"
+                    f"RMSE = {rmse:.3f}\n"
+                    f"BIAS = {bias:.3f}\n"
+                    f"KGE = {kge:.3f}"
+                ),
+                transform=ax.transAxes,
+                fontsize=9,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white',
+                        alpha=0.85, edgecolor='black')
+            )
 
     plt.tight_layout()
     if SAVE:
@@ -4684,10 +4849,14 @@ def loglog_contours_df(
     x_col,
     y_col,
     z_col,
+    zone=None,
     B=None,
     L=None,
-    B1=None,
+    B_threshold=None,
     anis=None,
+    plot_threshold=True,
+    plot_B_threshold=True,
+    plot_anis=True,
     x_label="X variable",
     y_label="Y variable",
     z_label="Response time [years]",
@@ -4710,11 +4879,33 @@ def loglog_contours_df(
     Parameters
     ----------
     df : pandas.DataFrame
-        Input dataframe
-    x_col, y_col, z_col : str
-        Column names for X, Y, Z
+        Input dataframe. Must contain a "zone" column when `zone` is
+        provided, and, if B/L/B_threshold are to default from it, the
+        "B_seq"/"L_seq"/"threshold_thickness" columns produced by
+        analyze_results.
+    x_col, y_col, z_col : str or array-like
+        Column names (when `zone` is provided, these are looked up in the
+        zone-subset of df) or, when `zone` is None, array-like values
+        (e.g. an already-subsetted pandas Series) for X, Y, Z directly.
+    zone : int, optional
+        If provided, df is subset to rows where df["zone"] == zone before
+        x_col/y_col/z_col are looked up as column names, and B, L, and
+        B_threshold default to that row's "B_seq", "L_seq", and
+        "threshold_thickness" columns (as produced by analyze_results).
     B, L : float, optional
-        If provided, plots reference line: Y/X = B²/L²
+        Reference system thickness/length: plots the line Y/X = B²/L².
+        If `zone` is provided, B and L default to that row's "B_seq"/
+        "L_seq" columns unless given directly, in which case the given
+        value overrides its counterpart independently of the other.
+    B_threshold : float, optional
+        Reference threshold thickness: plots the line Y/X = B_threshold²/L².
+        If `zone` is provided, defaults to that row's "threshold_thickness"
+        column unless given directly, in which case it overrides that value.
+    plot_threshold : bool
+        If True (default), the diagonal reference lines for B/L,
+        B_threshold/L, and anis (whichever are provided) are plotted. If
+        False, no diagonal reference lines are plotted regardless of
+        B, L, B_threshold, or anis.
     x_label, y_label, z_label : str
         Axis / colorbar labels
     y_max_log : float, optional
@@ -4730,6 +4921,23 @@ def loglog_contours_df(
     output_path_interpolation : str
         Path to save the interpolation figure if SAVE is True
     """
+    # --- Zone subsetting and geometry lookup ---
+    if zone is not None:
+        df_zone = df[df["zone"] == zone]
+        x_col = df_zone[x_col]
+        y_col = df_zone[y_col]
+        z_col = df_zone[z_col]
+
+        # This selects the first row of the zone subset, assuming B_seq, L_seq, and threshold_thickness are consistent within the zone.
+        # This is the case, since this function is meant to plot outputs of simulations sharing the same geometry through a
+        # systematic sensitivity analysis of diffusivities, guaranteeing that B_seq, L_seq, and threshold_thickness are the same for all rows of a given zone.
+        if "B_seq" in df_zone.columns:
+            B = B if B is not None else df_zone["B_seq"].iloc[0]
+        if "L_seq" in df_zone.columns:
+            L = L if L is not None else df_zone["L_seq"].iloc[0]
+        if "threshold_thickness" in df_zone.columns:
+            B_threshold = B_threshold if B_threshold is not None else df_zone["threshold_thickness"].iloc[0]
+
     # --- Log transforms ---
     d = pd.DataFrame({
     "X": np.asarray(x_col),
@@ -4802,14 +5010,14 @@ def loglog_contours_df(
 
     # --- Reference line ---
     if B is not None and L is not None:
-        ratio_log = np.log10((B ** 2) / (L ** 2))
+        ratio_log = np.log10(4 * (B ** 2) / (L ** 2))
         logX_line = np.linspace(x_log_min, x_log_max, 200)
         logY_line = logX_line + ratio_log
     
-    if B1 is not None and L is not None:
-        ratio1_log = np.log10((B1 ** 2) / (L ** 2))
-        logX_line1 = np.linspace(x_log_min, x_log_max, 200)
-        logY_line1 = logX_line1 + ratio1_log
+    if B_threshold is not None and L is not None:
+        ratio_threshold_log = np.log10(4 * (B_threshold ** 2) / (L ** 2))
+        logX_line_threshold = np.linspace(x_log_min, x_log_max, 200)
+        logY_line_threshold = logX_line_threshold + ratio_threshold_log
     
     if anis is not None:
         ratio_anis_log = np.log10((np.sqrt(anis)))
@@ -4824,10 +5032,15 @@ def loglog_contours_df(
             s.set_color("black")
             s.set_linewidth(1)
         ax.tick_params(direction="out", colors="black", labelsize=11)
+        # Only place ticks at whole orders of magnitude (integers in log10
+        # space), so every tick corresponds to an exact 10^n and none are
+        # produced by truncating an arbitrary non-integer tick position.
+        ax.xaxis.set_major_locator(MultipleLocator(1))
+        ax.yaxis.set_major_locator(MultipleLocator(1))
         return ax
 
     def log_formatter(val, pos):
-        return rf"$10^{{{int(val)}}}$"
+        return rf"$10^{{{int(round(val))}}}$"
 
     def fmt_pow10(val):
         return f"{int(10 ** val):g}"
@@ -4871,13 +5084,13 @@ def loglog_contours_df(
             s=40, edgecolors="black", linewidths=0.5
         )
 
-        if B is not None and L is not None:
+        if B is not None and L is not None and plot_threshold: 
             ax1.plot(logX_line, logY_line, "r--", lw=1)
         
-        if B1 is not None and L is not None:
-            ax1.plot(logX_line1, logY_line1, "b--", lw=1)   
+        if B_threshold is not None and L is not None and plot_B_threshold:
+            ax1.plot(logX_line_threshold, logY_line_threshold, "b--", lw=1)   
         
-        if anis is not None:       
+        if anis is not None and plot_anis:       
             ax1.plot(logX_line_anis, logY_line_anis, "g--", lw=1)
 
         ax1 = _clean_axes(ax1)
@@ -4896,7 +5109,7 @@ def loglog_contours_df(
 
         plt.tight_layout()
         if SAVE and output_path_regression is not None:
-            plt.savefig(output_path_regression, dpi=300)
+            plt.savefig(output_path_regression, dpi=300, bbox_inches="tight")
         else:
             plt.show()
 
@@ -4925,13 +5138,13 @@ def loglog_contours_df(
         s=40, edgecolors="black", linewidths=0.5
     )
 
-    if B is not None and L is not None:
+    if B is not None and L is not None and plot_threshold:
         ax2.plot(logX_line, logY_line, "r--", lw=1)
     
-    if B1 is not None and L is not None:
-        ax2.plot(logX_line1, logY_line1, "b--", lw=1)
+    if B_threshold is not None and L is not None and plot_B_threshold:
+        ax2.plot(logX_line_threshold, logY_line_threshold, "b--", lw=1)
     
-    if anis is not None:       
+    if anis is not None and plot_anis:       
         ax2.plot(logX_line_anis, logY_line_anis, "g--", lw=1)
 
     ax2 = _clean_axes(ax2)
@@ -4950,7 +5163,7 @@ def loglog_contours_df(
 
     plt.tight_layout()
     if SAVE and output_path_interpolation is not None:
-        plt.savefig(output_path_interpolation, dpi=300)
+        plt.savefig(output_path_interpolation, dpi=300, bbox_inches="tight")
     else:
         plt.show()
 
