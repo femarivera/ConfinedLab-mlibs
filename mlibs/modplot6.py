@@ -1229,3 +1229,81 @@ def plot_bud_sum_steady(file_path,
 
         fig.savefig(output_path, dpi=300)
         plt.close(fig)
+
+def plot_obs_vs_sim(obs_df, sim_array, obs_col, output_path,
+                     steady=True, time_step=-1,
+                     varname='Head', units='m',
+                     obs_color=None, custom_palette=False, palette=None,
+                     obs_label=None, label=False,
+                     show=False, save=True, figsize=(6, 6), fontsize=12):
+    """
+    Scatter plot of observed vs simulated values at a set of observation points,
+    for a single point in time (steady state, or one transient time step).
+
+    Args:
+        obs_df: DataFrame with 'row', 'col', 'lay' (0-based cell location) and
+            `obs_col` (the observed value), e.g. hobs_df ('h') or cobs_df ('c').
+        sim_array: simulated output array. Shape (nlay, nrow, ncol) if steady=True,
+            or (ntimes, nlay, nrow, ncol) if steady=False, in which case time_step
+            selects the time slice to compare against (default: -1, last step).
+        obs_col: name of the observed-value column in obs_df.
+        obs_color: optional column name in obs_df to color points by category
+            (e.g. aquifer name). If None, all points use one default color.
+        custom_palette: if True, use `palette` instead of an automatic colormap.
+        palette: dict of {category_value: (color, legend_label)}, required when
+            custom_palette=True, e.g. AQUIFER_PALETTE.
+        obs_label: optional column name in obs_df with per-point text labels.
+        label: if True (and obs_label given), annotate each point with its label text.
+    """
+    arr = sim_array if steady else sim_array[time_step]
+    sim_vals = arr[obs_df['lay'], obs_df['row'], obs_df['col']]
+    obs_vals = obs_df[obs_col].values
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_axisbelow(True)      # grid lines render behind data, not on top
+    ax.grid(True, zorder=0)
+
+    if obs_color is not None:
+        categories = obs_df[obs_color]
+        if custom_palette:
+            if palette is None:
+                raise ValueError("palette must be provided when custom_palette=True")
+            groups = list(palette.items())
+        else:
+            cmap = plt.get_cmap('tab10')
+            groups = [(cat, (cmap(i % 10), str(cat))) for i, cat in enumerate(categories.unique())]
+
+        for cat, (color, legend_label) in groups:
+            mask = (categories == cat).values
+            if not mask.any():
+                continue
+            ax.scatter(obs_vals[mask], sim_vals[mask], color=color, label=legend_label,
+                       edgecolors='k', linewidths=0.5, zorder=3)
+    else:
+        ax.scatter(obs_vals, sim_vals, edgecolors='k', linewidths=0.5, zorder=3)
+
+    if label and obs_label is not None:
+        for x, y, text in zip(obs_vals, sim_vals, obs_df[obs_label]):
+            ax.annotate(str(text), (x, y), textcoords="offset points", xytext=(5, 5),
+                        fontsize=fontsize * 0.7)
+
+    lims = [np.nanmin([obs_vals.min(), sim_vals.min()]), np.nanmax([obs_vals.max(), sim_vals.max()])]
+    ax.plot(lims, lims, 'k--', lw=1, label='1:1', zorder=2)
+
+    rmse = np.sqrt(np.nanmean((sim_vals - obs_vals) ** 2))
+    ax.set_xlabel(f'Observed {varname} [{units}]', fontsize=fontsize)
+    ax.set_ylabel(f'Simulated {varname} [{units}]', fontsize=fontsize)
+    mode = 'Steady state' if steady else f'Transient, step {time_step}'
+    ax.set_title(f'{varname}: observed vs simulated ({mode})\nRMSE = {rmse:.3g} {units}', fontsize=fontsize)
+    ax.legend(fontsize=fontsize * 0.8)
+    ax.set_aspect('equal', adjustable='box')
+    plt.tight_layout()
+
+    if show:
+        plt.show()
+    if save:
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        fig.savefig(output_path, dpi=300)
+        plt.close(fig)

@@ -67,7 +67,9 @@ def plot_head_time_series(head_file_path,
                           figsize=(14, 12), 
                           fontsize=14, 
                           tau=None, 
-                          time_units='days'):
+                          time_units='days',
+                          label='Head [m]',
+                          title = 'HEAD TIME SERIES'):
     """
     Plot MODFLOW 6 simulated groundwater head time series for one or more observation points.
 
@@ -114,8 +116,8 @@ def plot_head_time_series(head_file_path,
 
     # Automatically adapt the y-axis limits based on the data range
     plt.xlabel(time_axis_label, fontsize=fontsize/1.2)
-    plt.ylabel('Head [m]', fontsize=fontsize/1.2)
-    plt.title('HEAD TIME SERIES', fontsize=fontsize)
+    plt.ylabel(label, fontsize=fontsize/1.2)
+    plt.title(title, fontsize=fontsize)
     plt.legend(fontsize=fontsize/1.2)
     plt.grid(True)
 

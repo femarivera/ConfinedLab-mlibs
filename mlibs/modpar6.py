@@ -20,8 +20,16 @@
 #  - Helper functions to get variogram parameters according to common summary statistics of prior data/knowledge
 
 import numpy as np
+import pandas as pd
 from scipy.stats import norm
 from scipy.fft import fftn, ifftn, fftfreq
+import os
+import pyemu
+from mlibs import modgeom6 # type: ignore
+from pyemu.pst.pst_utils import SFMT, FFMT
+import re
+from io import StringIO
+
 
 def moments_from_arithmetic_mean_variance(arith_mean, arith_var):
     """
@@ -245,3 +253,247 @@ def par_df_to_1Darray(df, prefix):
     subset = df[df.index.str.startswith(prefix)]
     subset = subset.sort_index()  # Ensure correct order
     return subset["value"].to_numpy()
+
+def read_parfile_safe(parfile):
+    """
+    Drop-in replacement for pyemu.pst_utils.read_parfile. PEST++ sometimes writes
+    parval1 with a very long decimal expansion that runs directly into the
+    following scale field with no separating whitespace. Since scale/offset are
+    always the fixed literal "1.0000000000E+00"/"0.0000000000E+00" we write
+    ourselves, insert the missing space right before that literal wherever it's
+    glued to a preceding digit, then parse normally.
+    """
+    with open(parfile) as f:
+        header = f.readline()
+        body = f.read()
+    body = re.sub(r'(\d)(1\.0000000000E\+00)', r'\1 \2', body)
+    par_df = pd.read_csv(StringIO(body), header=None,
+                          names=["parnme", "parval1", "scale", "offset"], sep=r"\s+")
+    par_df.index = par_df.parnme
+    return par_df
+
+
+def parameterize_V1(par_df, name, nglay=None, nrow=None, ncol=None,
+                  irch=None, pest=False, pest_dir='pest', expand=True):
+    """
+    Resolve parameter `name` purely from its par_df['type'] entry:
+      'single'   -> one bare scalar value, no glay indexing
+      '2darray'  -> one scalar per geological layer; expanded via `irch` into
+                    (nrow, ncol) when expand=True, or returned as the raw
+                    1D (nglay,) array when expand=False (so it can be subdivided
+                    and re-expanded later with a different irch)
+      '3darray'  -> one field per geological layer -> (nglay, nrow, ncol).
+                    When pest=True, each glay row's own par_df['pp'] flag decides
+                    how that layer is resolved: True -> pilot-point kriged via
+                    fac2real, False -> a single calibrated scalar from par.dat,
+                    broadcast uniformly. When pest=False, always a plain per-layer
+                    scalar from par_df['value'] (par_df_to_1Darray/compute_3Darray),
+                    regardless of 'pp'.
+    Source is the setup file (par_df) when pest=False, PEST's current
+    par.dat / pilot-point files when pest=True.
+    """
+    ptype = par_df.loc[name, 'type'] if name in par_df.index else par_df.loc[f'{name}_01', 'type']
+
+    if ptype == 'single':
+        if not pest:
+            return par_df.loc[name, 'value']
+        pest_par_df = read_parfile_safe(os.path.join(pest_dir, 'par.dat')) #pyemu.pst_utils.read_parfile gets me some bug I have not managed
+        return pest_par_df.loc[name.lower(), 'parval1']
+
+    if ptype == '2darray':
+        if not pest:
+            values_1d = par_df_to_1Darray(par_df, name)
+        else:
+            pest_par_df = read_parfile_safe(os.path.join(pest_dir, 'par.dat'))
+            values_1d = np.array([
+                pest_par_df.loc[f'{name}_{i+1:02d}'.lower(), 'parval1'] for i in range(nglay)
+            ])
+        return modgeom6.compute_recharge(irch, values_1d) if expand else values_1d
+
+    if ptype == '3darray':
+        if not pest:
+            values_1d = par_df_to_1Darray(par_df, name)
+            return modgeom6.compute_3Darray(values_1d, nglay, nrow, ncol)
+
+        pest_par_df = read_parfile_safe(os.path.join(pest_dir, 'par.dat'))
+        field_list = []
+        for glay in range(nglay):
+            parname = f'{name}_{glay+1:02d}'
+            if par_df.loc[parname, 'pp']:
+                pp_file  = os.path.join(pest_dir, f'{parname}_pp.dat')
+                fac_file = os.path.join(pest_dir, f'{parname}.fac')
+                field = pyemu.utils.fac2real(pp_file=pp_file, factors_file=fac_file, out_file=None)
+                field_list.append(np.asarray(field).reshape(nrow, ncol))
+            else:
+                value = pest_par_df.loc[parname.lower(), 'parval1']
+                field_list.append(np.full((nrow, ncol), value))
+        return stack_fields_to_3D(field_list, nglay, nrow, ncol)
+
+    raise ValueError(f"Unknown par_df type '{ptype}' for parameter '{name}'")
+
+def _parnme_order_from_tpl(tpl_file):
+    """Parameter names in file order, read straight from a .tpl file's ~...~ markers."""
+    names = []
+    with open(tpl_file) as f:
+        next(f)  # skip "ptf ~"
+        for line in f:
+            m = re.search(r'~\s*(\S+)\s*~', line)
+            if m:
+                names.append(m.group(1))
+    return names
+
+
+def parameterize(par_df, name, nglay=None, nrow=None, ncol=None,
+                  irch=None, pest=False, pest_dir='pest', expand=True,
+                  ensemble=False, ensemble_file=None, ensemble_stat='mean', ensemble_real=None):
+    """
+    Resolve parameter `name` purely from its par_df['type'] entry:
+      'single'   -> one bare scalar value, no glay indexing
+      '2darray'  -> one scalar per geological layer; expanded via `irch` into
+                    (nrow, ncol) when expand=True, or returned as the raw
+                    1D (nglay,) array when expand=False (so it can be subdivided
+                    and re-expanded later with a different irch)
+      '3darray'  -> one field per geological layer -> (nglay, nrow, ncol).
+                    When pest=True, each glay row's own par_df['pp'] flag decides
+                    how that layer is resolved: True -> pilot-point kriged via
+                    fac2real, False -> a single calibrated scalar from par.dat,
+                    broadcast uniformly. When pest=False, always a plain per-layer
+                    scalar from par_df['value'] (par_df_to_1Darray/compute_3Darray),
+                    regardless of 'pp'.
+    Source is the setup file (par_df) when pest=False, PEST's current
+    par.dat / pilot-point files when pest=True.
+
+    ensemble (bool): if True (requires pest=True), resolve the parameter's value(s) from a
+        PEST++ IES parameter ensemble CSV (e.g. 'cal_ss.10.par.csv') instead of from
+        par.dat/pilot-point files -- for running the model with a summary of, or a draw from,
+        the calibrated posterior.
+    ensemble_file (str): path to the ensemble CSV (pestpp-ies format: columns are parameter
+        names, index is realization name).
+    ensemble_stat (str): 'mean', 'median', 'p5', 'p95', or 'random'. The first four are
+        computed independently per parameter/pilot point across all realizations. 'random'
+        instead pulls a single realization's values, given by ensemble_real.
+    ensemble_real (str): required when ensemble_stat='random' -- the realization name to use.
+        Pick this ONCE per forward run (e.g. np.random.choice(ens_df.index)) and pass the SAME
+        value into every parameterize() call for that run, so all parameters come from the
+        same coherent posterior sample rather than independently mismatched realizations.
+    """
+    ptype = par_df.loc[name, 'type'] if name in par_df.index else par_df.loc[f'{name}_01', 'type']
+
+    if ensemble:
+        if not pest:
+            raise ValueError("ensemble=True requires pest=True")
+        ens_df = pd.read_csv(ensemble_file, index_col='real_name')
+
+        def _stat(colnames):
+            sub = ens_df[colnames]
+            if ensemble_stat == 'mean':
+                return sub.mean().values
+            elif ensemble_stat == 'median':
+                return sub.median().values
+            elif ensemble_stat == 'p5':
+                return sub.quantile(0.05).values
+            elif ensemble_stat == 'p95':
+                return sub.quantile(0.95).values
+            elif ensemble_stat == 'random':
+                if ensemble_real is None:
+                    raise ValueError("ensemble_stat='random' requires ensemble_real")
+                return sub.loc[ensemble_real].values
+            else:
+                raise ValueError(f"Unknown ensemble_stat '{ensemble_stat}'")
+
+        if ptype == 'single':
+            return _stat([name])[0]
+
+        if ptype == '2darray':
+            colnames = [f'{name}_{i+1:02d}' for i in range(nglay)]
+            values_1d = _stat(colnames)
+            return modgeom6.compute_recharge(irch, values_1d) if expand else values_1d
+
+        if ptype == '3darray':
+            field_list = []
+            for glay in range(nglay):
+                parname = f'{name}_{glay+1:02d}'
+                if par_df.loc[parname, 'pp']:
+                    pp_file  = os.path.join(pest_dir, f'{parname}_pp.dat')
+                    fac_file = os.path.join(pest_dir, f'{parname}.fac')
+                    tpl_file = os.path.join(pest_dir, f'{parname}_pp.dat.tpl')
+                    pp_df = pyemu.pp_utils.pp_file_to_dataframe(pp_file)
+                    parnmes = _parnme_order_from_tpl(tpl_file)
+                    assert len(parnmes) == len(pp_df), f"{parname}: tpl/dat pilot point count mismatch"
+                    pp_df['parval1'] = _stat(parnmes)
+                    field = pyemu.utils.fac2real(pp_file=pp_df, factors_file=fac_file, out_file=None)
+                    field_list.append(np.asarray(field).reshape(nrow, ncol))
+                else:
+                    field_list.append(np.full((nrow, ncol), _stat([parname])[0]))
+            return stack_fields_to_3D(field_list, nglay, nrow, ncol)
+
+        raise ValueError(f"Unknown par_df type '{ptype}' for parameter '{name}'")
+
+    if ptype == 'single':
+        if not pest:
+            return par_df.loc[name, 'value']
+        pest_par_df = read_parfile_safe(os.path.join(pest_dir, 'par.dat')) #pyemu.pst_utils.read_parfile gets me some bug I have not managed
+        return pest_par_df.loc[name.lower(), 'parval1']
+
+    if ptype == '2darray':
+        if not pest:
+            values_1d = par_df_to_1Darray(par_df, name)
+        else:
+            pest_par_df = read_parfile_safe(os.path.join(pest_dir, 'par.dat'))
+            values_1d = np.array([
+                pest_par_df.loc[f'{name}_{i+1:02d}'.lower(), 'parval1'] for i in range(nglay)
+            ])
+        return modgeom6.compute_recharge(irch, values_1d) if expand else values_1d
+
+    if ptype == '3darray':
+        if not pest:
+            values_1d = par_df_to_1Darray(par_df, name)
+            return modgeom6.compute_3Darray(values_1d, nglay, nrow, ncol)
+
+        pest_par_df = read_parfile_safe(os.path.join(pest_dir, 'par.dat'))
+        field_list = []
+        for glay in range(nglay):
+            parname = f'{name}_{glay+1:02d}'
+            if par_df.loc[parname, 'pp']:
+                pp_file  = os.path.join(pest_dir, f'{parname}_pp.dat')
+                fac_file = os.path.join(pest_dir, f'{parname}.fac')
+                field = pyemu.utils.fac2real(pp_file=pp_file, factors_file=fac_file, out_file=None)
+                field_list.append(np.asarray(field).reshape(nrow, ncol))
+            else:
+                value = pest_par_df.loc[parname.lower(), 'parval1']
+                field_list.append(np.full((nrow, ncol), value))
+        return stack_fields_to_3D(field_list, nglay, nrow, ncol)
+
+    raise ValueError(f"Unknown par_df type '{ptype}' for parameter '{name}'")
+
+def write_par_tpl(par_df, tpl_file, par_file):
+    """
+    Write a PEST template file and matching initial par.dat for a set of scalar
+    parameters, in the 4-column format expected by pyemu.pst_utils.read_parfile
+    (header line + parnme/parval1/scale/offset). Only parval1 is a PEST marker;
+    scale/offset are fixed text so the file PEST writes back stays parseable.
+
+    par_df: DataFrame indexed by parameter name, with a 'value' column.
+    """
+    with open(tpl_file, "w") as f:
+        f.write("ptf ~\n")
+        f.write("single point\n")
+        for name in par_df.index:
+            f.write(SFMT(name) + "~{0:^30s}~".format(name) + FFMT(1.0) + FFMT(0.0) + "\n")
+
+    with open(par_file, "w") as f:
+        f.write("single point\n")
+        for name, value in par_df['value'].items():
+            f.write(SFMT(name) + FFMT(value) + FFMT(1.0) + FFMT(0.0) + "\n")
+
+def setup_ins(obs_names, ins_filename):
+    """
+    Write a PEST instruction file assuming one observation value per line, in the
+    same order as obs_names -- matches the long-format output written by the
+    model_pest_*.py post-processing step (SIMULATED EQUIVALENT is the first
+    whitespace-delimited token on each data line).
+    """
+    with open(ins_filename, "w") as f:
+        f.write("pif ~\n")
+        for i, name in enumerate(obs_names):
+            f.write(f"{'l2' if i == 0 else 'l1'} !{name}!\n")

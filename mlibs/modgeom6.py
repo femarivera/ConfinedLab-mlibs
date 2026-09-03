@@ -29,6 +29,98 @@
 #  the typical stratigraphic configuration of a sedimentary basin without faulting or folding. 
 
 import numpy as np
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry import Point
+import warnings
+
+def get_xi(xs_shp, shp, buff_dist = None, jfields = True):
+    """
+    -----------
+    Description
+    -----------
+    Compute curvilinear distance of a 2D (cross-section) line and others geometries 
+    -----------
+    Parameters
+    -----------
+    - xs_shp (str) : path to the (cross-section) shapefile
+    - shp (str) : path to the intersection shapefile
+    - buff_dist (numeric) : threshold distance around cross section line to consider 
+                            points to project
+                            Default is None (all points are projected)
+    - jfields (optional, bool or list) : informations (columns) in the input shapefile
+                                         to be joined to the output
+                                         If True, all fields are joined.
+                                         If list, only fields in list are joined
+                                         Default is True
+    -----------
+    Returns
+    -----------
+    - df or gdf  
+    -----------
+    Examples
+    -----------
+    >>> df =  get_xs_curv_dist(xs_shp, piezo_shp, jfields = ['14C'])
+    """
+
+    # ---- Load shapefiles as Geodataframe
+    xs_gdf = gpd.read_file(xs_shp)
+    feat_gdf = gpd.read_file(shp)
+
+    # ---- Remove entries from feat_gdf with none type geometries
+    feat_gdf.drop(feat_gdf[feat_gdf.geometry==None].index,inplace=True)
+
+    # ---- Check whether all features from feat_shp have the same geometry
+    msg = f'All geometries from {shp} should be identical'
+    assert (feat_gdf.geom_type == feat_gdf.geom_type[0]).all(), msg
+    geom_type = feat_gdf.geom_type[0]
+
+    # ---- Check whether projections are identical
+    if not xs_gdf.crs == feat_gdf.crs:
+        warn_msg = '\nCross-section et Feature shapefiles have different projections'
+        warnings.warn(warn_msg)
+
+    # ---- Point geometry management
+    if geom_type == 'Point':
+        if buff_dist is None:
+            gdf = feat_gdf.copy()
+        else:
+            # -- Fetch points to keep in the buffer around cross-section line
+            buff = xs_gdf.geometry.buffer(buff_dist)
+            gdf = gpd.sjoin(feat_gdf, xs_gdf.set_geometry(buff), predicate = 'within')
+        # -- Get projected points and curvilinear distance
+        gdf['geometry'] = gdf.geometry.apply(lambda p : xs_gdf.interpolate(xs_gdf.project(p))).squeeze()
+        gdf['xi'] = gdf.geometry.apply(lambda p : xs_gdf.project(p))
+
+    # ---- Line or Polygon geometry management
+    if geom_type in ['LineString', 'Polygon']:
+        # -- Convert polygon to line (perimeter)
+        if geom_type == 'Polygon':
+            feat_gdf['geometry'] = feat_gdf.exterior
+        # -- Perform spatial join between cross_section and line shapefile
+        inter_gdf = gpd.sjoin(feat_gdf, xs_gdf, predicate = 'intersects')
+        # -- Fetch intersected geometry between these 2 GeoDataFrame
+        #    Can be line, points, multipoints
+        inter_gdf['geometry'] = feat_gdf.geometry.apply(lambda l: xs_gdf.unary_union.intersection(l))
+        # -- Explode muti-part geometries into multiple single geometries and drop duplicates
+        gdf = inter_gdf.explode(index_parts=True)[~inter_gdf.explode(index_parts=True).geometry.duplicated()]
+        # -- Get projected points and curvilinear distance
+        gdf['xi'] = gdf.geometry.apply(lambda p : xs_gdf.project(p))
+
+    # ---- Add projected points coordinates
+    gdf['xproj'], gdf['yproj'] = zip(*[[p.x, p.y] for p in gdf['geometry']])
+    df = pd.DataFrame(gdf.drop(['geometry'], axis = 1)).reset_index()
+
+    # ---- Manage fields
+    if isinstance(jfields, list):
+        # -- Keep only required fields
+        fields = jfields + ['xi', 'xproj', 'yproj']
+    else:
+        fields = list(df.columns)
+
+    # ---- Get final DataFrame
+    return df[fields]
+
 
 def compute_idomain(nlay, nrow, ncol, outcrop_cells, direction = "right"):
     """

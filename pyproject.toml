@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlibs"
-version = "0.1.1"
+version = "0.1.2"
 description = "MODFLOW 6 modelling utilities - ConfinedLab project"
 authors = [
   { name = "MARIN RIVERA Carlos Felipe" }
@@ -21,6 +21,7 @@ dependencies = [
     "geopandas>=1.0",
     "shapely",
     "scikit-learn>=1.6",
+    "pyemu>=1.3",
 ]
 
 [tool.setuptools.packages.find]

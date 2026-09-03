@@ -44,7 +44,7 @@ def create_riv_spd(
         cells (list of tuples): List of (k, i, j) tuples specifying layer, row, and column indices.
         ztop (3D array): Top elevation of each cell (shape: nlay x nrow x ncol).
         thickness_array (3D array): Thickness of each cell (shape: nlay x nrow x ncol).
-        k_array (1D array): Hydraulic conductivity of riverbed for each layer (shape: nlay) for conductance calculation.
+        k_array (float, 1D array): Hydraulic conductivity of riverbed for each layer (shape: nlay) for conductance calculation.
         river_length (float): Length of the river over the cells (horizontal discretization) for conductance calculation.
         river_width (float, optional): Width of the river (default: 1) for conductance calculation.
         riverbed_thickness (float, optional): Thickness of the riverbed (default: 1) for conductance calculation.
@@ -53,7 +53,7 @@ def create_riv_spd(
         a (float, optional): Offset for the location of river stage relative to the top elevation of the cell.
                             If 'proportion', must be 0 < a < 1. If 'absolute', must be a > 0.
         b (float, optional): Desired separation between river stage and river bottom (in model units, default: 1.0).
-        conc (float or None, optional): River concentration (if applicable). Default is None.
+        conc (float, 2D array, or None, optional): River concentration (if applicable). Default is None.
 
     Returns:
         riv_spd (dict): Stress period data for the river boundary condition.
@@ -66,8 +66,6 @@ def create_riv_spd(
         raise ValueError("ztop must be a 3D array (nlay, nrow, ncol).")
     if not (hasattr(thickness_array, "shape") and len(thickness_array.shape) == 3):
         raise ValueError("thickness_array must be a 3D array (nlay, nrow, ncol).")
-    if not (hasattr(k_array, "shape") and len(k_array.shape) == 1):
-        raise ValueError("k_array must be a 1D array (nlay,).")
     if not (isinstance(river_length, (float, int)) and river_length > 0):
         raise ValueError("river_length must be a positive number.")
     if not (isinstance(riverbed_thickness, (float, int)) and riverbed_thickness > 0):
@@ -84,14 +82,21 @@ def create_riv_spd(
         raise ValueError("stage_type must be either 'proportion' or 'absolute'.")
     if not (isinstance(b, (float, int)) and b >= 0):
         raise ValueError("b must be a non-negative number (desired separation in model units).")
-    if conc is not None and not isinstance(conc, (float, int)):
-        raise ValueError("conc must be a float, int, or None.")
-
+    if conc is not None and not (isinstance(conc, (float, int)) or hasattr(conc, "shape")):
+        raise ValueError("conc must be a float, int, 2D array, or None.")
     nlay, nrow, ncol = ztop.shape
     if thickness_array.shape != (nlay, nrow, ncol):
         raise ValueError("thickness_array must have the same shape as ztop.")
-    if k_array.shape[0] != nlay:
-        raise ValueError("k_array length must match the number of layers in ztop.")
+    if isinstance(k_array, (float, int)):
+        k_array = np.full(nlay, k_array, dtype=float)
+    elif hasattr(k_array, "shape") and len(k_array.shape) == 1:
+        if k_array.shape[0] != nlay:
+            raise ValueError(
+            f"k_array must have length nlay ({nlay}), "
+            f"but has length {k_array.shape[0]}.")
+    else:
+        raise ValueError(
+        "k_array must be either a scalar or a 1D array of length nlay.")
     
     # Initialize the stress period data dictionary
     riv_spd = {}
@@ -121,7 +126,8 @@ def create_riv_spd(
         riv_cond = (k_array[k] * river_length * river_width) / (riverbed_thickness)
 
         if conc is not None:
-            riv_entries.append((k, i, j, riv_stage, riv_cond, riv_bottom, conc))
+            cell_conc = conc[i, j] if hasattr(conc, "shape") else conc
+            riv_entries.append((k, i, j, riv_stage, riv_cond, riv_bottom, cell_conc))
         else:
             riv_entries.append((k, i, j, riv_stage, riv_cond, riv_bottom))
 
@@ -145,7 +151,7 @@ def create_ghb_spd(
     - cells (list of tuples): A list of (k, i, j) tuples specifying the layer, row, and column indices of the cells.
     - ztop (3D array): Top elevation of each cell (shape = nlay x nrow x ncol). 
     - thickness_array (3D array): Thickness of each cell (shape = nlay x nrow x ncol).
-    - k_array (1D array): Hydraulic conductivity for each layer (shape = nlay).   
+    - k_array (float, 1D array): Hydraulic conductivity for each layer (shape = nlay).   
     - ghb_length (float): Length of the ghb for conductance calculation (for lateral flow it corresponds to the cell width
                         perpendicular to the flow direction).
     - ghb_width (float): Width of the ghb for conductance calculation (for lateral flow it corresponds to the saturated thickness
@@ -157,7 +163,7 @@ def create_ghb_spd(
                                  If 'absolute', a is absolute offset.
     - a (float, optional): Offset for the location of ghb stage relative to the top elevation of the cell.
                             If 'proportion', must be 0 < a < 1. If 'absolute', must be a > 0.    
-    - conc (float or None, optional): ghb concentration (if applicable). Default is None.
+    - conc (float, 2D array, or None, optional): ghb concentration (if applicable). Default is None.
 
     Returns:
     - ghb_spd (dict): Stress period data for the ghb boundary condition.
@@ -170,8 +176,6 @@ def create_ghb_spd(
         raise ValueError("ztop must be a 3D array (nlay, nrow, ncol).")
     if not (hasattr(thickness_array, "shape") and len(thickness_array.shape) == 3):
         raise ValueError("thickness_array must be a 3D array (nlay, nrow, ncol).")
-    if not (hasattr(k_array, "shape") and len(k_array.shape) == 1):
-        raise ValueError("k_array must be a 1D array (nlay,).")
     if not (isinstance(ghb_length, (float, int)) and ghb_length > 0):
         raise ValueError("ghb_length must be a positive number.")
     if not (isinstance(ghb_distance, (float, int)) and ghb_distance > 0):
@@ -184,14 +188,22 @@ def create_ghb_spd(
             raise ValueError("For 'absolute' gh_type, 'a' must be a positive float or int (a > 0).")
     else:
         raise ValueError("gh_type must be either 'proportion' or 'absolute'.")
-    if conc is not None and not isinstance(conc, (float, int)):
-        raise ValueError("conc must be a float, int, or None.")
+    if conc is not None and not (isinstance(conc, (float, int)) or hasattr(conc, "shape")):
+        raise ValueError("conc must be a float, int, 2D array, or None.")
 
     nlay, nrow, ncol = ztop.shape
     if thickness_array.shape != (nlay, nrow, ncol):
         raise ValueError("thickness_array must have the same shape as ztop.")
-    if k_array.shape[0] != nlay:
-        raise ValueError("k_array length must match the number of layers in ztop.")
+    if isinstance(k_array, (float, int)):
+        k_array = np.full(nlay, k_array, dtype=float)
+    elif hasattr(k_array, "shape") and len(k_array.shape) == 1:
+        if k_array.shape[0] != nlay:
+            raise ValueError(
+            f"k_array must have length nlay ({nlay}), "
+            f"but has length {k_array.shape[0]}.")
+    else:
+        raise ValueError(
+        "k_array must be either a scalar or a 1D array of length nlay.")
     
     # Initialize the stress period data dictionary
     ghb_spd = {}
@@ -214,7 +226,8 @@ def create_ghb_spd(
         ghb_cond = (k_array[k] * ghb_length * thickness_array[k, i, j]) / (ghb_distance)
 
         if conc is not None:
-            ghb_entries.append((k, i, j, ghb_elev, ghb_cond, conc))
+            cell_conc = conc[i, j] if hasattr(conc, "shape") else conc
+            ghb_entries.append((k, i, j, ghb_elev, ghb_cond, cell_conc))
         else:
             ghb_entries.append((k, i, j, ghb_elev, ghb_cond))
 
@@ -239,7 +252,7 @@ def create_drn_spd(
     - cells (list of tuples): A list of (k, i, j) tuples specifying the layer, row, and column indices of the cells.
     - ztop (3D array): Top elevation of each cell (shape = nlay x nrow x ncol). 
     - thickness_array (3D array): Thickness of each cell (shape = nlay x nrow x ncol).
-    - k_array (1D array): Hydraulic conductivity for each layer (shape = nlay).   
+    - k_array (float, 1D array): Hydraulic conductivity for each layer (shape = nlay).   
     - drain_length (float): Length of the drain for conductance calculation.
     - drain_width (float): Width of the drain for conductance calculation.
     - drainbed_thickness (float): Thickness of the sediments at the drain for conductance calculation (default 1 model units).
@@ -248,7 +261,7 @@ def create_drn_spd(
                                  If 'absolute', a is absolute offset.
     - a (float, optional): Offset for the location of drain stage relative to the top elevation of the cell.
                             If 'proportion', must be 0 < a < 1. If 'absolute', must be a > 0.    
-    - conc (float or None, optional): Drain concentration (if applicable). Default is None.
+    - conc (float, 2D array, or None, optional): Drain concentration (if applicable). Default is None.
 
     Returns:
     - drn_spd (dict): Stress period data for the drain boundary condition.
@@ -261,8 +274,6 @@ def create_drn_spd(
         raise ValueError("ztop must be a 3D array (nlay, nrow, ncol).")
     if not (hasattr(thickness_array, "shape") and len(thickness_array.shape) == 3):
         raise ValueError("thickness_array must be a 3D array (nlay, nrow, ncol).")
-    if not (hasattr(k_array, "shape") and len(k_array.shape) == 1):
-        raise ValueError("k_array must be a 1D array (nlay,).")
     if not (isinstance(drain_length, (float, int)) and drain_length > 0):
         raise ValueError("drain_length must be a positive number.")
     if not (isinstance(drainbed_thickness, (float, int)) and drainbed_thickness > 0):
@@ -277,14 +288,22 @@ def create_drn_spd(
             raise ValueError("For 'absolute' elev_type, 'a' must be a positive float or int (a >= 0).")
     else:
         raise ValueError("elev_type must be either 'proportion' or 'absolute'.")
-    if conc is not None and not isinstance(conc, (float, int)):
-        raise ValueError("conc must be a float, int, or None.")
+    if conc is not None and not (isinstance(conc, (float, int)) or hasattr(conc, "shape")):
+        raise ValueError("conc must be a float, int, 2D array, or None.")
 
     nlay, nrow, ncol = ztop.shape
     if thickness_array.shape != (nlay, nrow, ncol):
         raise ValueError("thickness_array must have the same shape as ztop.")
-    if k_array.shape[0] != nlay:
-        raise ValueError("k_array length must match the number of layers in ztop.")
+    if isinstance(k_array, (float, int)):
+        k_array = np.full(nlay, k_array, dtype=float)
+    elif hasattr(k_array, "shape") and len(k_array.shape) == 1:
+        if k_array.shape[0] != nlay:
+            raise ValueError(
+            f"k_array must have length nlay ({nlay}), "
+            f"but has length {k_array.shape[0]}.")
+    else:
+        raise ValueError(
+        "k_array must be either a scalar or a 1D array of length nlay.")
     
     # Initialize the stress period data dictionary
     drn_spd = {}
@@ -306,7 +325,8 @@ def create_drn_spd(
         drn_cond = (k_array[k] * drain_length * drain_width) / (drainbed_thickness)
 
         if conc is not None:
-            drn_entries.append((k, i, j, drn_elev, drn_cond, conc))
+            cell_conc = conc[i, j] if hasattr(conc, "shape") else conc
+            drn_entries.append((k, i, j, drn_elev, drn_cond, cell_conc))
         else:
             drn_entries.append((k, i, j, drn_elev, drn_cond))
 
