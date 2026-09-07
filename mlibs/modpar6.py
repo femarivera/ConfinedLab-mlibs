@@ -342,10 +342,9 @@ def _parnme_order_from_tpl(tpl_file):
                 names.append(m.group(1))
     return names
 
-
 def parameterize(par_df, name, nglay=None, nrow=None, ncol=None,
                   irch=None, pest=False, pest_dir='pest', expand=True,
-                  ensemble=False, ensemble_file=None, ensemble_stat='mean', ensemble_real=None):
+                  ensemble=False, ensemble_file=None, ensemble_real=None):
     """
     Resolve parameter `name` purely from its par_df['type'] entry:
       'single'   -> one bare scalar value, no glay indexing
@@ -365,48 +364,33 @@ def parameterize(par_df, name, nglay=None, nrow=None, ncol=None,
 
     ensemble (bool): if True (requires pest=True), resolve the parameter's value(s) from a
         PEST++ IES parameter ensemble CSV (e.g. 'cal_ss.10.par.csv') instead of from
-        par.dat/pilot-point files -- for running the model with a summary of, or a draw from,
-        the calibrated posterior.
+        par.dat/pilot-point files -- for running the model with one specific realization
+        from the calibrated posterior.
     ensemble_file (str): path to the ensemble CSV (pestpp-ies format: columns are parameter
         names, index is realization name).
-    ensemble_stat (str): 'mean', 'median', 'p5', 'p95', or 'random'. The first four are
-        computed independently per parameter/pilot point across all realizations. 'random'
-        instead pulls a single realization's values, given by ensemble_real.
-    ensemble_real (str): required when ensemble_stat='random' -- the realization name to use.
-        Pick this ONCE per forward run (e.g. np.random.choice(ens_df.index)) and pass the SAME
-        value into every parameterize() call for that run, so all parameters come from the
-        same coherent posterior sample rather than independently mismatched realizations.
+    ensemble_real (str): required when ensemble=True -- the realization name to pull (e.g.
+        'base', or a random draw from ens_df.index chosen once by the caller). Pick this ONCE
+        per forward run and pass the SAME value into every parameterize() call for that run,
+        so all parameters come from the same coherent posterior sample.
     """
     ptype = par_df.loc[name, 'type'] if name in par_df.index else par_df.loc[f'{name}_01', 'type']
 
     if ensemble:
         if not pest:
             raise ValueError("ensemble=True requires pest=True")
+        if ensemble_real is None:
+            raise ValueError("ensemble=True requires ensemble_real")
         ens_df = pd.read_csv(ensemble_file, index_col='real_name')
 
-        def _stat(colnames):
-            sub = ens_df[colnames]
-            if ensemble_stat == 'mean':
-                return sub.mean().values
-            elif ensemble_stat == 'median':
-                return sub.median().values
-            elif ensemble_stat == 'p5':
-                return sub.quantile(0.05).values
-            elif ensemble_stat == 'p95':
-                return sub.quantile(0.95).values
-            elif ensemble_stat == 'random':
-                if ensemble_real is None:
-                    raise ValueError("ensemble_stat='random' requires ensemble_real")
-                return sub.loc[ensemble_real].values
-            else:
-                raise ValueError(f"Unknown ensemble_stat '{ensemble_stat}'")
+        def _get(colnames):
+            return ens_df.loc[ensemble_real, colnames].values
 
         if ptype == 'single':
-            return _stat([name])[0]
+            return _get([name])[0]
 
         if ptype == '2darray':
             colnames = [f'{name}_{i+1:02d}' for i in range(nglay)]
-            values_1d = _stat(colnames)
+            values_1d = _get(colnames)
             return modgeom6.compute_recharge(irch, values_1d) if expand else values_1d
 
         if ptype == '3darray':
@@ -420,11 +404,11 @@ def parameterize(par_df, name, nglay=None, nrow=None, ncol=None,
                     pp_df = pyemu.pp_utils.pp_file_to_dataframe(pp_file)
                     parnmes = _parnme_order_from_tpl(tpl_file)
                     assert len(parnmes) == len(pp_df), f"{parname}: tpl/dat pilot point count mismatch"
-                    pp_df['parval1'] = _stat(parnmes)
+                    pp_df['parval1'] = _get(parnmes)
                     field = pyemu.utils.fac2real(pp_file=pp_df, factors_file=fac_file, out_file=None)
                     field_list.append(np.asarray(field).reshape(nrow, ncol))
                 else:
-                    field_list.append(np.full((nrow, ncol), _stat([parname])[0]))
+                    field_list.append(np.full((nrow, ncol), _get([parname])[0]))
             return stack_fields_to_3D(field_list, nglay, nrow, ncol)
 
         raise ValueError(f"Unknown par_df type '{ptype}' for parameter '{name}'")
@@ -432,7 +416,7 @@ def parameterize(par_df, name, nglay=None, nrow=None, ncol=None,
     if ptype == 'single':
         if not pest:
             return par_df.loc[name, 'value']
-        pest_par_df = read_parfile_safe(os.path.join(pest_dir, 'par.dat')) #pyemu.pst_utils.read_parfile gets me some bug I have not managed
+        pest_par_df = read_parfile_safe(os.path.join(pest_dir, 'par.dat'))
         return pest_par_df.loc[name.lower(), 'parval1']
 
     if ptype == '2darray':
@@ -465,6 +449,7 @@ def parameterize(par_df, name, nglay=None, nrow=None, ncol=None,
         return stack_fields_to_3D(field_list, nglay, nrow, ncol)
 
     raise ValueError(f"Unknown par_df type '{ptype}' for parameter '{name}'")
+
 
 def write_par_tpl(par_df, tpl_file, par_file):
     """

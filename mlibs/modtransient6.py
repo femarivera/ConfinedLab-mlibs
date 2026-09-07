@@ -69,7 +69,8 @@ def plot_head_time_series(head_file_path,
                           tau=None, 
                           time_units='days',
                           label='Head [m]',
-                          title = 'HEAD TIME SERIES'):
+                          title = 'HEAD TIME SERIES',
+                          legend=True):
     """
     Plot MODFLOW 6 simulated groundwater head time series for one or more observation points.
 
@@ -118,7 +119,8 @@ def plot_head_time_series(head_file_path,
     plt.xlabel(time_axis_label, fontsize=fontsize/1.2)
     plt.ylabel(label, fontsize=fontsize/1.2)
     plt.title(title, fontsize=fontsize)
-    plt.legend(fontsize=fontsize/1.2)
+    if legend:
+        plt.legend(fontsize=fontsize/1.2)
     plt.grid(True)
 
     # Plot equilibrium lines if tau is provided
