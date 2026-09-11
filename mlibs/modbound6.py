@@ -21,6 +21,8 @@
 #  - Utilities for extracting active cell indices from irch/idomain arrays, with options for subsetting and sampling.
 
 import numpy as np
+import pandas as pd
+import itertools
 import geopandas as gpd
 from shapely.geometry import Polygon
 
@@ -641,3 +643,68 @@ def active_cells_from_line(grid_shp, river_shp):
     # Extract cell ids (k,i,j)
     cell_ids = [(int(row.irch), int(row.row), int(row.col)) for idx, row in inter.iterrows()]
     return cell_ids
+
+def build_vdiff_pairs(hobs_df, zcenters, col_buffer=1, weight=1.0):
+    """
+    Build vertical head-difference observation pairs from an hobs dataframe.
+
+    For every unordered pair of observations (P, Q) whose assigned model column
+    differs by at most col_buffer (units, number of cells) and whose assigned
+    model layers differ, create one vdiff pair, oriented by cell-center elevation
+    so the observation with the higher elevation cell is always id_hi -- this
+    avoids emitting both (P-Q) and (Q-P) as sign-flipped duplicates of the same
+    information.
+
+    Args:
+        hobs_df (pandas.DataFrame): observation dataframe indexed by observation id,
+            with 'row', 'col', 'lay' columns.
+        zcenters (numpy.ndarray): (nlay, nrow, ncol) cell-center elevation array.
+        col_buffer (int): max allowed column separation between two observations
+            for them to be considered vertically paired (default 1).
+        'id' columns in hobs_df must be unique.
+        weight (float): weight to assign to each vdiff pair (default 1.0).
+
+    Returns:
+        pandas.DataFrame: one row per vdiff pair with a non-zero observed difference, 
+        indexed by generated pair id,
+        with columns 'id_hi', 'id_lo' (shallower/deeper source observation ids),
+        'h_hi', 'h_lo' (observed head values), 'obsval' (observed difference), 
+        and 'w' (weight).
+    """
+    pairs = []
+    for id_a, id_b in itertools.combinations(hobs_df.index, 2):
+        col_a, col_b = hobs_df.loc[id_a, 'col'], hobs_df.loc[id_b, 'col']
+        if abs(col_a - col_b) > col_buffer:
+            continue
+        lay_a, lay_b = hobs_df.loc[id_a, 'lay'], hobs_df.loc[id_b, 'lay']
+        if lay_a == lay_b:
+            continue
+        z_a = zcenters[lay_a, hobs_df.loc[id_a, 'row'], col_a]
+        z_b = zcenters[lay_b, hobs_df.loc[id_b, 'row'], col_b]
+        id_hi, id_lo = (id_a, id_b) if z_a >= z_b else (id_b, id_a)
+        pairs.append({'id_hi': id_hi, 'id_lo': id_lo})
+    pairs_df = pd.DataFrame(pairs)
+    pairs_df['id'] = [f'vd_{r.id_hi}_{r.id_lo}' for r in pairs_df.itertuples()]
+    pairs_df['h_hi'] = hobs_df.loc[pairs_df['id_hi'], 'h'].values
+    pairs_df['h_lo'] = hobs_df.loc[pairs_df['id_lo'], 'h'].values
+    pairs_df['obsval'] = pairs_df['h_hi'] - pairs_df['h_lo']
+    pairs_df = pairs_df[pairs_df['obsval'] != 0]
+    pairs_df['w'] = weight
+    return pairs_df.set_index('id', drop=False)
+
+def compute_vdiffs(pairs_df, head_series):
+    """
+    Compute vertical head-difference values (head_hi - head_lo) for each pair of observations
+    considered to be vertically paired (along the same vertical column within the col_buffer tolerance)
+    from simulated head values.
+
+    Args:
+        pairs_df (pandas.DataFrame): output of build_vdiff_pairs (needs 'id_hi','id_lo').
+        head_series (pandas.Series): simulated head value per observation id, indexed by the
+            same ids referenced in pairs_df['id_hi']/['id_lo'].
+
+    Returns:
+        pandas.Series: vdiff value per pair, indexed like pairs_df.
+    """
+    vals = head_series.loc[pairs_df['id_hi']].to_numpy() - head_series.loc[pairs_df['id_lo']].to_numpy()
+    return pd.Series(vals, index=pairs_df.index)

@@ -403,8 +403,6 @@ def plot_cross_section_row(gwf,
         raise ValueError("head file path must be provided.")
     if not isinstance(row, int) or row < 0:
         raise ValueError("row must be a non-negative integer.")
-    if not isinstance(output_path, str) or not output_path:
-        raise ValueError("output_path must be a non-empty string.")
     if boundary_keywords is not None and not isinstance(boundary_keywords, list):
         raise ValueError("boundary_keywords must be a list of strings or None.")
     if not isinstance(flow_dir, bool):
@@ -555,6 +553,8 @@ def plot_cross_section_row(gwf,
 
     # Save plot
     if save:
+        if not isinstance(output_path, str) or not output_path:
+            raise ValueError("output_path must be a non-empty string.")
         # Create directory if it does not exist
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.exists(output_dir):
@@ -623,8 +623,6 @@ def plot_cross_section_col(gwf,
         raise ValueError("head file path must be provided.")
     if not isinstance(col, int) or col < 0:
         raise ValueError("col must be a non-negative integer.")
-    if not isinstance(output_path, str) or not output_path:
-        raise ValueError("output_path must be a non-empty string.")
     if boundary_keywords is not None and not isinstance(boundary_keywords, list):
         raise ValueError("boundary_keywords must be a list of strings or None.")
     if not isinstance(flow_dir, bool):
@@ -771,6 +769,8 @@ def plot_cross_section_col(gwf,
 
     # Save plot
     if save:
+        if not isinstance(output_path, str) or not output_path:
+            raise ValueError("output_path must be a non-empty string.")
         # Create directory if it does not exist
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.exists(output_dir):
@@ -832,8 +832,6 @@ def plot_cross_section_array(gwf,
         raise ValueError("gwf (MODFLOW 6 model object) must be provided.")
     if not isinstance(row, int) or row < 0:
         raise ValueError("row must be a non-negative integer.")
-    if not isinstance(output_path, str) or not output_path:
-        raise ValueError("output_path must be a non-empty string.")
     if boundary_keywords is not None and not isinstance(boundary_keywords, list):
         raise ValueError("boundary_keywords must be a list of strings or None.")
     if not isinstance(show, bool):
@@ -933,11 +931,14 @@ def plot_cross_section_array(gwf,
     
     #Save plot
     if save:
+        if not isinstance(output_path, str) or not output_path:
+            raise ValueError("output_path must be a non-empty string.")
         # Create directory if it does not exist
         output_dir = os.path.dirname(output_path)
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
+        fig = ax.get_figure()
         fig.savefig(output_path, dpi=300)
         plt.close(fig)  
 
@@ -1307,3 +1308,41 @@ def plot_obs_vs_sim(obs_df, sim_array, obs_col, output_path,
             os.makedirs(output_dir)
         fig.savefig(output_path, dpi=300)
         plt.close(fig)
+
+def scatter_plot(obs_df, sim_df, obs_col, title, xlabel, out_path):
+    """Scatter plot of observed vs. simulated values, paired by observation id.
+
+    Args:
+        obs_df (pandas.DataFrame): observation definitions, indexed by observation
+            id (e.g. hobs_df, cobs_df, vdiffs_df), with an `obs_col` column holding
+            the observed value. User generated input.
+        sim_df (pandas.DataFrame): simulated values as read directly from a MODFLOW6
+            output CSV (Output control package), one row per time step, one column per
+            observation id. Only the last row is used (the only row, for steady-state). 
+            Column names are matched against obs_df index case-insensitively, so it doesn't 
+            matter whether the source file ids happen to already be uppercase (MODFLOW's own output) 
+            or not.
+        obs_col (str): name of the column in `obs_df` holding the observed value
+            (e.g. 'h', 'c', 'obsval').
+        title (str): plot title.
+        xlabel (str): value description, e.g. 'head (m)' -- used as "Observed
+            {xlabel}" / "Simulated {xlabel}" for the x/y axis labels.
+        out_path (str): path to save the figure to.
+    """
+    sim_row = sim_df.iloc[-1]
+    sim_row.index = sim_row.index.str.upper()
+    simval = sim_row[obs_df.index.str.upper()].values
+    obsval = obs_df[obs_col].values
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.scatter(obsval, simval, edgecolors='k', linewidths=0.5)
+    lims = [min(obsval.min(), simval.min()), max(obsval.max(), simval.max())]
+    ax.plot(lims, lims, 'k--', lw=1)
+    ax.set_xlabel(f'Observed {xlabel}')
+    ax.set_ylabel(f'Simulated {xlabel}')
+    ax.set_title(title)
+    ax.set_aspect('equal', adjustable='box')
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
