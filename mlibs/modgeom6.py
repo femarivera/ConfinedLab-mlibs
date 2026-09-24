@@ -711,7 +711,7 @@ def storage_coefficient(sy_cells, idomain, ss, sy, thickness):
             storage_coeff[k, i, j] = sy[k, i, j]
 
     # inactive cells are nan
-    storage_coeff[idomain == 0] = np.nan
+    storage_coeff[idomain != 1] = np.nan
 
     return storage_coeff
 
@@ -727,7 +727,7 @@ def storage_cell_type(sy_cells, idomain):
             sto_cell_type[k, i, j] = 0
 
     # inactive cells are nan
-    sto_cell_type[idomain == 0] = np.nan
+    sto_cell_type[idomain != 1] = np.nan
 
     return sto_cell_type
 
@@ -792,5 +792,11 @@ def add_top_layer(arr3d, value=None):
         value = arr3d[0, :, :]
     return np.vstack((value[None, :, :], arr3d))
 
+def layer_area(glay, geom_df, idomain, inland, dcol, irch):
+    """glay: 1-based geological layer number. Returns (inland_area, outcrop_area) in model units."""
+    mlay, flay = int(geom_df.loc[glay - 1, 'mlay']), int(geom_df.loc[glay - 1, 'flay'])
+    present = (idomain[mlay:flay + 1, 0, :] == 1).any(axis=0)
+    outcrop = (irch[0] >= mlay) & (irch[0] <= flay)
+    return (present & inland).sum() * dcol, (outcrop & inland).sum() * dcol
 
 

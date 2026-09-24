@@ -34,6 +34,8 @@ import shutil
 import subprocess
 import gc
 import time
+import warnings
+from typing import Optional
 from mlibs import modplot6 # type: ignore
 
 def simplify_name(name):
@@ -611,7 +613,7 @@ def estimate_sustainable_yield(
             - "constrain" (str): Component acting as constrain ("LEAKAGE", "DRN", "RIV", "GHB", etc).
             - "flow" (str): Flow type ("IN", "OUT", "NET", "CBB"). If "NET" the net outflow is considered (OUT - IN).
                 If "CBB", constraints from the cell budget file analysis are considered.
-            Positive values indicate outflow from the system, negative values indicate inflow to the system.
+            Positive values indicate inflow to the system, negative values indicate outflow from the system.
             - "zone" (str): Zone ID or "ALL" for the constraint.
             - "threshold_type" (str): Type of threshold ("ABSOLUTE" or "RELATIVE").
             - "threshold" (float): Threshold value for the constraint.
@@ -710,13 +712,6 @@ def estimate_sustainable_yield(
       reference (natural-conditions) point. See crossing_rel_tol / the per-constraint "tolerance"
       key above.
     """
-
-    import os
-    import warnings
-    import numpy as np
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    from typing import Optional
 
     output_folder = os.path.abspath(output_folder)
 

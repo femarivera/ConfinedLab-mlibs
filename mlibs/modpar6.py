@@ -362,7 +362,10 @@ def parameterize(par_df, name, nglay=None, nrow=None, ncol=None,
     Source is the setup file (par_df) when pest=False, PEST's current
     par.dat / pilot-point files when pest=True.
 
-    ensemble (bool): if True (requires pest=True), resolve the parameter's value(s) from a
+    When pest=False, pest_dir and all ensemble* arguments are ignored: everything is read
+    from par_df.
+
+    ensemble (bool): if True (and pest=True; ignored when pest=False), resolve the parameter's value(s) from a
         PEST++ IES parameter ensemble CSV (e.g. 'cal_ss.10.par.csv') instead of from
         par.dat/pilot-point files -- for running the model with one specific realization
         from the calibrated posterior.
@@ -375,12 +378,10 @@ def parameterize(par_df, name, nglay=None, nrow=None, ncol=None,
     """
     ptype = par_df.loc[name, 'type'] if name in par_df.index else par_df.loc[f'{name}_01', 'type']
 
-    if ensemble:
-        if not pest:
-            raise ValueError("ensemble=True requires pest=True")
+    if ensemble and pest:
         if ensemble_real is None:
             raise ValueError("ensemble=True requires ensemble_real")
-        ens_df = pd.read_csv(ensemble_file, index_col='real_name')
+        ens_df = pd.read_csv(ensemble_file, index_col='real_name', dtype={"real_name": str})
 
         def _get(colnames):
             return ens_df.loc[ensemble_real, colnames].values

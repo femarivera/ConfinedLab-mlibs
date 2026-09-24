@@ -4235,7 +4235,7 @@ def load_cell_volumes(dis_path):
 
 def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict,
                      subfolder_keyword="parv_", volume_weighted=True,
-                     B=None, L=None, B_threshold=None):
+                     B=None, L=None, B_threshold=None, kv_anis = False):
     """
     Collect results and append statistics per zone and total.
 
@@ -4262,6 +4262,9 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict,
         Global threshold thickness. If provided, used instead of the
         per-sequence threshold_thickness in the analytical timescale
         formulas below.
+    kv_anis : bool, optional
+        If True, the vertical hydraulic conductivity (kv) is provided as an anisotropy ratio (kv/kh)
+        instead of the absolute value. Default is False.
 
     Notes on B_seq / L_seq
     -----------------------
@@ -4339,8 +4342,13 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict,
         zones_h = [int(z) for z in zones if int(z) % 2 == 1]  # Aquifers
         zones_v = [int(z) for z in zones if int(z) % 2 == 0]  # Aquitards
 
-        kv = {int(z): param_dict.get(f"kv_{z}") / 86400 for z in zones}  # Converted to m/s
-        kh = {int(z): param_dict.get(f"kh_{z}") / 86400 for z in zones}  # Converted to m/s
+        if kv_anis:
+            # If kv is provided as an anisotropy ratio, compute absolute kv values
+            kh = {int(z): param_dict.get(f"kh_{z}") / 86400 for z in zones}  # Converted to m/s
+            kv = {int(z): kh[int(z)] * param_dict.get(f"kv_{z}") for z in zones}  # kv = kh * anisotropy ratio
+        else:
+            kv = {int(z): param_dict.get(f"kv_{z}") / 86400 for z in zones}  # Converted to m/s
+            kh = {int(z): param_dict.get(f"kh_{z}") / 86400 for z in zones}  # Converted to m/s
         ss = {int(z): param_dict.get(f"ss_{z}") for z in zones}
         sy = {int(z): param_dict.get(f"sy_{z}") for z in zones}
 
@@ -4397,7 +4405,6 @@ def analyze_results(main_folder, thickness_dict, length_dict, unc_length_dict,
         df_zone_out["L_seq"] = df_zone_out["zone"].map(L_seq)
 
         df_zone_out["anisotropy"] = df_zone_out["kh"] / df_zone_out["kv"]
-
         # ----------------------------------------------------------------------- #
         # -------------------- COMPUTE RESPONSE TIME STATISTICS ----------------- #
         # ----------------------------------------------------------------------- #

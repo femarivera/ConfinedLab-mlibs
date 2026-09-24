@@ -708,3 +708,48 @@ def compute_vdiffs(pairs_df, head_series):
     """
     vals = head_series.loc[pairs_df['id_hi']].to_numpy() - head_series.loc[pairs_df['id_lo']].to_numpy()
     return pd.Series(vals, index=pairs_df.index)
+
+def next_active_layer(idomain, lay, row, col, flay=None, force_glay=False):
+    """
+    Find the next active layer in the idomain array starting from a given layer index.
+    Used to relocate observations that fall on an inactive cell to the next active layer below them.
+
+    force_glay (bool): if True, the search stops at `flay` (the last sublayer of the same
+        geological layer as `lay`) instead of the bottom of the model. If no active sublayer is
+        found within [lay, flay], the observation is dropped (returns -1) rather than being
+        relocated into a different geological layer. `flay` is required when force_glay=True.
+    """
+    if force_glay:
+        assert flay is not None, "flay is required when force_glay=True"
+        stop = flay + 1
+    else:
+        stop = idomain.shape[0]
+    for l in range(lay, stop):
+        if idomain[l, row, col] == 1:
+            return l
+    return -1  # no active layer found within the search range
+
+def assign_nearest_layer(row, zcenters, z_col):
+    """
+    Nearest sublayer to row[z_col], within [row.mlay, row.flay], clipped at the ends.
+    row[z_col] NaN -> falls back to row.clay (the unit's center sublayer).
+    Returns (z, lay): the resolved elevation and the chosen sublayer index.
+
+    Used to project observation points onto the cross sectional model.
+    """
+    r, c = row['row'], row['col']
+    z = row[z_col]
+    if pd.isna(z):
+        lay = row['clay']
+        return zcenters[lay, r, c], lay
+    mlay, flay = row['mlay'], row['flay']
+    z_mlay = zcenters[mlay, r, c]
+    z_flay = zcenters[flay, r, c]
+    if z > z_mlay:
+        return z_mlay, mlay
+    elif z < z_flay:
+        return z_flay, flay
+    lay_range = np.arange(mlay, flay + 1)
+    z_layers = zcenters[lay_range, r, c]
+    nearest_lay = lay_range[np.argmin(np.abs(z_layers - z))]
+    return z, nearest_lay
